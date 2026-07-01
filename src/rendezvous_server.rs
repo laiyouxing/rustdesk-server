@@ -445,16 +445,8 @@ impl RendezvousServer {
                     }
                 }
                 Some(rendezvous_message::Union::PunchHoleRequest(ph)) => {
-                    if self.pm.is_in_memory(&ph.id).await {
-                        self.handle_udp_punch_hole_request(addr, ph, key).await?;
-                    } else {
-                        // not in memory, fetch from db with spawn in case blocking me
-                        let mut me = self.clone();
-                        let key = key.to_owned();
-                        tokio::spawn(async move {
-                            allow_err!(me.handle_udp_punch_hole_request(addr, ph, &key).await);
-                        });
-                    }
+                    // UDP PunchHoleRequest is intentionally unsupported.
+                    // The supported client path sends PunchHoleRequest over TCP/WS.
                 }
                 Some(rendezvous_message::Union::PunchHoleSent(phs)) => {
                     self.handle_hole_sent(phs, addr, Some(socket)).await?;
@@ -1133,6 +1125,9 @@ impl RendezvousServer {
     }
 
     #[inline]
+    // UDP 的 PunchHoleRequest 已按上游 CVE-2026-30784 修复停用（防 UDP 反射放大）。
+    // 保留实现以便将来若重新启用时有据可查，故允许未使用。
+    #[allow(dead_code)]
     async fn handle_udp_punch_hole_request(
         &mut self,
         addr: SocketAddr,
