@@ -52,6 +52,19 @@ fn arg_name(name: &str) -> String {
     name.to_uppercase().replace('_', "-")
 }
 
+/// 把 `.env` 里的键值加载进进程环境（键保持原样，不做 `arg_name` 规范化）。
+///
+/// hbbr 是独立 binary，不走 `init_args()`；历史上它在 `node_agent::start()`
+/// **之后**才读 .env，导致 `RD_API_SERVER` / `RD_NODE_KEY` / `RD_NODE_SECRET`
+/// 等全部读不到，集群 agent 静默不启动。
+pub fn load_env_file() {
+    if let Ok(v) = Ini::load_from_file(".env") {
+        if let Some(section) = v.section(None::<String>) {
+            section.iter().for_each(|(k, v)| std::env::set_var(k, v));
+        }
+    }
+}
+
 #[allow(dead_code)]
 pub fn init_args(args: &str, name: &str, about: &str) {
     let matches = App::new(name)
@@ -62,9 +75,12 @@ pub fn init_args(args: &str, name: &str, about: &str) {
         .get_matches();
     if let Ok(v) = Ini::load_from_file(".env") {
         if let Some(section) = v.section(None::<String>) {
-            section
-                .iter()
-                .for_each(|(k, v)| std::env::set_var(arg_name(k), v));
+            section.iter().for_each(|(k, v)| {
+                // 原始键（RD_API_SERVER）与启动参数规范键（RD-API-SERVER）都要设上：
+                // node_agent 直接读 RD_* 变量，只设规范化后的键会让它读不到。
+                std::env::set_var(k, v);
+                std::env::set_var(arg_name(k), v);
+            });
         }
     }
     if let Some(config) = matches.value_of("config") {

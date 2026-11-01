@@ -19,10 +19,14 @@
 #   docker run -d --name hbbr --restart unless-stopped --network host \
 #     -e RD_API_SERVER=https://183.24.70.210:21120 \
 #     -e RD_NODE_KEY=<rustdesk key> \
+#     -e RD_NODE_SECRET=<节点接入密钥，与 api-server 的 node.secret 一致；留空则不发 X-Node-Secret> \
 #     -e RD_NODE_ADDR=<本机公网IP>:21117 \
-#     -e RD_NODE_LAN_ADDR=10.126.126.5 \
+#     -e RD_NODE_LAN_ADDR=10.126.126.5:21117 \
 #     -e RD_NODE_REGION=GX \
 #     rustdesk-hbbr:1.1.17 -k "<key>"
+#
+# 注意 RD_NODE_LAN_ADDR **必须带端口**（10.126.126.5:21117）。只填 IP 会让
+# api-server 的健康检查探测失败、RTT 恒为 0（RTT=0 还会被评分当成"最快"）。
 
 FROM alpine:3.20
 

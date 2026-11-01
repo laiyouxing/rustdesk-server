@@ -177,4 +177,20 @@ impl PeerMap {
     pub(crate) async fn is_in_memory(&self, id: &str) -> bool {
         self.map.read().await.contains_key(id)
     }
+
+    /// 在线 peer 数：最近 `timeout_ms` 毫秒内有注册/心跳的 peer。
+    ///
+    /// 供 hbbs 心跳上报（原先 `node_agent::ONLINE_PEERS` 从未被写入，peers 恒为 0）。
+    /// 逐个 `try_read` 取 `last_reg_time`，拿不到锁就跳过（3s 后下一次刷新会补上），
+    /// 避免"持有 map 读锁再等 peer 写锁"的潜在死锁。
+    pub(crate) async fn online_count(&self, timeout_ms: i64) -> usize {
+        let map = self.map.read().await;
+        map.values()
+            .filter(|p| {
+                p.try_read()
+                    .map(|r| (r.last_reg_time.elapsed().as_millis() as i64) < timeout_ms)
+                    .unwrap_or(false)
+            })
+            .count()
+    }
 }

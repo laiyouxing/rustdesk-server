@@ -1,5 +1,13 @@
-﻿# syntax=docker/dockerfile:1
+# syntax=docker/dockerfile:1
 # RustDesk hbbs（本仓库定制版）—— musl 静态二进制，scratch 基础镜像
+#
+# ⚠️ scratch 镜像里**没有 ca-certificates**。内置集群 agent（src/node_agent.rs）
+#    访问 https:// api-server 时依赖 reqwest 的 `danger_accept_invalid_certs(true)`
+#    （见 node_agent::build_client）：
+#      - 自签名证书可以直接用（生产就是这个场景）；
+#      - 但也意味着**证书链不做校验**，中间人可劫持 agent 上报。
+#    如需严格 TLS：换成带 ca-certificates 的基础镜像（如 alpine），把 CA 证书
+#    放到 /etc/ssl/certs/ 后再关掉 danger_accept_invalid_certs。
 # 构建：docker build -f Dockerfile.hbbs -t rustdesk-hbbs:1.1.17 .
 FROM scratch
 COPY hbbs /usr/local/bin/hbbs

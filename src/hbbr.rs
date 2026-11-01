@@ -13,6 +13,10 @@ fn main() -> ResultType<()> {
         .format(opt_format)
         .write_mode(WriteMode::Async)
         .start()?;
+    // .env 必须在 node_agent::start 之前加载：agent 读的是 RD_* 环境变量，
+    // 历史上两者顺序反了，导致 .env 里的 RD_API_SERVER / RD_NODE_KEY 全部读不到、
+    // 集群 agent 静默不启动。
+    common::load_env_file();
     let args = format!(
         "-p, --port=[NUMBER(default={RELAY_PORT})] 'Sets the listening port'
         -k, --key=[KEY] 'Only allow the client with the same key'
@@ -26,15 +30,10 @@ fn main() -> ResultType<()> {
         .get_matches();
     // 集群 agent：注册到 api-server 并定期上报活跃连接数
     // 注册限速热更新回调，使 api-server 下发的限速配置能立即生效
-    node_agent::set_limits_apply(|limit, single, total, threshold, check_ms| {
-        relay_server::apply_limits(limit, single, total, threshold, check_ms);
-    });
-    node_agent::start("hbbr", "127.0.0.1:21117");
-    if let Ok(v) = ini::Ini::load_from_file(".env") {
-        if let Some(section) = v.section(None::<String>) {
-            section.iter().for_each(|(k, v)| std::env::set_var(k, v));
-        }
-    }
+    node_agent::set_limits_apply(relay_server::apply_limits);
+    // 活跃连接数由 relay_server 自己维护，agent 心跳时实时取值（不再镜像到原子量）
+    node_agent::set_conns_getter(relay_server::active_conns);
+    node_agent::start("hbbr");
     let mut port = RELAY_PORT;
     if let Ok(v) = std::env::var("PORT") {
         let v: i32 = v.parse().unwrap_or_default();

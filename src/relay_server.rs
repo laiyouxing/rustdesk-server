@@ -39,41 +39,91 @@ lazy_static::lazy_static! {
 
 static DOWNGRADE_THRESHOLD_100: AtomicUsize = AtomicUsize::new(66); // 0.66
 static DOWNGRADE_START_CHECK: AtomicUsize = AtomicUsize::new(1_800_000); // in ms
-static LIMIT_SPEED: AtomicUsize = AtomicUsize::new(32 * 1024 * 1024); // in bit/s
-static TOTAL_BANDWIDTH: AtomicUsize = AtomicUsize::new(1024 * 1024 * 1024); // in bit/s
-static SINGLE_BANDWIDTH: AtomicUsize = AtomicUsize::new(128 * 1024 * 1024); // in bit/s
-
-/// 供集群 agent 热更新限速与降级参数（api-server 下发，立即生效，无需重启）。
+/// 黑名单（人工封禁的 IP）连接限速，bit/s；0 = 不限制。
+/// 可由 api-server 下发 `limit_speed_mbps` 覆盖。
+static LIMIT_SPEED: AtomicUsize = AtomicUsize::new(32 * 1024 * 1024);
+/// 总带宽限速，bit/s；0 = 不限制。真实落点是 [`LIMITER`]（本文件 io_loop 里初始化）。
+static TOTAL_BANDWIDTH: AtomicUsize = AtomicUsize::new(1024 * 1024 * 1024);
+/// 单连接限速，bit/s；0 = 不限制。
+/// **只在连接建立时读取一次，因此热更新只对新连接生效**（见 [`relay`]）。
+static SINGLE_BANDWIDTH: AtomicUsize = AtomicUsize::new(128 * 1024 * 1024);
+/// 自动降级连接的固定惩罚带宽（bit/s），与 `LIMIT_SPEED` 解耦。
 ///
+/// 上游把默认 LIMIT_SPEED 从 4Mb/s 上调到 32Mb/s（commit `1d6c53d higher default
+/// bandwidth`），而平台下发的 `limit_speed_mbps` 还可能被管理员填成节点总带宽：
+/// 若降级直接复用 LIMIT_SPEED，降级惩罚会越来越弱、甚至完全失效。
+/// 这里固定为 4Mb/s，保证"超量降速"始终有实际惩罚。
+const DOWNGRADE_LIMIT_SPEED: usize = 4 * 1024 * 1024; // 4 Mb/s
+
+/// 全局总带宽限速器。
+///
+/// 以前 Limiter 只在 io_loop 里 `new` 一次、apply_limits 只改原子量，
+/// 导致 api-server 下发的 total_bandwidth **假生效**（日志显示已应用，实际流量不受限）。
+/// 现在 io_loop 把实例存进来，apply_limits 直接 `set_speed_limit`。
+static LIMITER: once_cell::sync::OnceCell<Limiter> = once_cell::sync::OnceCell::new();
+
+/// bit/s → async_speed_limit 的速度参数；**0 表示不限制**（该 crate 用 INFINITY 表达）。
+fn speed_limit(bit_per_sec: usize) -> f64 {
+    if bit_per_sec == 0 {
+        f64::INFINITY
+    } else {
+        bit_per_sec as f64
+    }
+}
+
+/// 日志用：bit/s → "32Mb/s" / "不限制"。
+fn fmt_speed(bit_per_sec: usize) -> String {
+    if bit_per_sec == 0 {
+        "不限制".to_owned()
+    } else {
+        format!("{}Mb/s", bit_per_sec / 1024 / 1024)
+    }
+}
+
+/// 供集群 agent 热更新限速与降级参数（api-server 下发，无需重启）。
+///
+/// 语义与 api-server 约定严格一致：`None` = 保持不变，`Some(0)` = 不限制（解除限速）。
 /// 参数单位：bandwidth 为 bit/s；downgrade_threshold_100 为百分比整数（66 = 0.66）；
-/// downgrade_start_check_ms 为毫秒。传 0 表示该项保持不变。
+/// downgrade_start_check_ms 为毫秒。
+///
+/// 生效范围：
+///   - 总带宽 → 立即生效（直接改 [`LIMITER`] 的速度限制）；
+///   - 单连接 / 黑名单 / 降级限速 → **只对新建立的连接生效**（连接建立时读取原子量）。
 pub fn apply_limits(
-    limit_speed: usize,
-    single_bandwidth: usize,
-    total_bandwidth: usize,
-    downgrade_threshold_100: usize,
-    downgrade_start_check_ms: usize,
+    limit_speed: Option<usize>,
+    single_bandwidth: Option<usize>,
+    total_bandwidth: Option<usize>,
+    downgrade_threshold_100: Option<usize>,
+    downgrade_start_check_ms: Option<usize>,
 ) {
-    if limit_speed > 0 {
-        LIMIT_SPEED.store(limit_speed, Ordering::Relaxed);
+    if let Some(v) = limit_speed {
+        LIMIT_SPEED.store(v, Ordering::Relaxed);
     }
-    if single_bandwidth > 0 {
-        SINGLE_BANDWIDTH.store(single_bandwidth, Ordering::Relaxed);
+    if let Some(v) = single_bandwidth {
+        SINGLE_BANDWIDTH.store(v, Ordering::Relaxed);
     }
-    if total_bandwidth > 0 {
-        TOTAL_BANDWIDTH.store(total_bandwidth, Ordering::Relaxed);
+    if let Some(v) = total_bandwidth {
+        TOTAL_BANDWIDTH.store(v, Ordering::Relaxed);
+        match LIMITER.get() {
+            Some(limiter) => limiter.set_speed_limit(speed_limit(v)),
+            // 启动早期（io_loop 还没跑）收到配置：记下原子量，io_loop 初始化时按它建 Limiter
+            None => log::warn!(
+                "[node-agent] 总带宽限速器尚未初始化（relay io_loop 未启动），配置已记录，启动时生效"
+            ),
+        }
     }
-    if downgrade_threshold_100 > 0 {
-        DOWNGRADE_THRESHOLD_100.store(downgrade_threshold_100, Ordering::Relaxed);
+    if let Some(v) = downgrade_threshold_100 {
+        DOWNGRADE_THRESHOLD_100.store(v, Ordering::Relaxed);
     }
-    if downgrade_start_check_ms > 0 {
-        DOWNGRADE_START_CHECK.store(downgrade_start_check_ms, Ordering::Relaxed);
+    if let Some(v) = downgrade_start_check_ms {
+        DOWNGRADE_START_CHECK.store(v, Ordering::Relaxed);
     }
+    // 打印"实际生效值"（0 显示为不限制），而不是回读原子量后除以 1024/1024 得到迷惑的 0Mb/s
     log::info!(
-        "[node-agent] 已应用限速配置: LIMIT_SPEED={}Mb/s SINGLE={}Mb/s TOTAL={}Mb/s THRESHOLD={}% CHECK={}ms",
-        LIMIT_SPEED.load(Ordering::Relaxed) / 1024 / 1024,
-        SINGLE_BANDWIDTH.load(Ordering::Relaxed) / 1024 / 1024,
-        TOTAL_BANDWIDTH.load(Ordering::Relaxed) / 1024 / 1024,
+        "[node-agent] 已应用限速配置（实际生效值）: limit_speed={} single_bandwidth={} total_bandwidth={} downgrade_threshold={}% downgrade_start_check={}ms",
+        fmt_speed(LIMIT_SPEED.load(Ordering::Relaxed)),
+        fmt_speed(SINGLE_BANDWIDTH.load(Ordering::Relaxed)),
+        fmt_speed(TOTAL_BANDWIDTH.load(Ordering::Relaxed)),
         DOWNGRADE_THRESHOLD_100.load(Ordering::Relaxed),
         DOWNGRADE_START_CHECK.load(Ordering::Relaxed),
     );
@@ -265,8 +315,9 @@ async fn check_cmd(cmd: &str, limiter: Limiter) -> String {
         Some("downgrade-threshold" | "dt") => {
             if let Some(v) = fds.next() {
                 if let Ok(v) = v.parse::<f64>() {
-                    if v > 0. {
-                        DOWNGRADE_THRESHOLD_100.store((v * 100.) as _, Ordering::SeqCst);
+                    // 0 表示关闭自动降级（与 api-server 的 0 = 不限制语义一致）
+                    if v >= 0. {
+                        DOWNGRADE_THRESHOLD_100.store((v.min(100.) * 100.) as _, Ordering::SeqCst);
                     }
                 }
             } else {
@@ -279,9 +330,8 @@ async fn check_cmd(cmd: &str, limiter: Limiter) -> String {
         Some("downgrade-start-check" | "t") => {
             if let Some(v) = fds.next() {
                 if let Ok(v) = v.parse::<usize>() {
-                    if v > 0 {
-                        DOWNGRADE_START_CHECK.store(v * 1000, Ordering::SeqCst);
-                    }
+                    // 0 = 关闭自动降级的时间门槛
+                    DOWNGRADE_START_CHECK.store(v * 1000, Ordering::SeqCst);
                 }
             } else {
                 res = format!("{}s\n", DOWNGRADE_START_CHECK.load(Ordering::SeqCst) / 1000);
@@ -290,44 +340,37 @@ async fn check_cmd(cmd: &str, limiter: Limiter) -> String {
         Some("limit-speed" | "ls") => {
             if let Some(v) = fds.next() {
                 if let Ok(v) = v.parse::<f64>() {
-                    if v > 0. {
+                    if v >= 0. {
                         LIMIT_SPEED.store((v * 1024. * 1024.) as _, Ordering::SeqCst);
                     }
                 }
             } else {
-                res = format!(
-                    "{}Mb/s\n",
-                    LIMIT_SPEED.load(Ordering::SeqCst) as f64 / 1024. / 1024.
-                );
+                res = format!("{}\n", fmt_speed(LIMIT_SPEED.load(Ordering::SeqCst)));
             }
         }
         Some("total-bandwidth" | "tb") => {
             if let Some(v) = fds.next() {
                 if let Ok(v) = v.parse::<f64>() {
-                    if v > 0. {
-                        TOTAL_BANDWIDTH.store((v * 1024. * 1024.) as _, Ordering::SeqCst);
-                        limiter.set_speed_limit(TOTAL_BANDWIDTH.load(Ordering::SeqCst) as _);
+                    if v >= 0. {
+                        let bit = (v * 1024. * 1024.) as usize;
+                        TOTAL_BANDWIDTH.store(bit, Ordering::SeqCst);
+                        // 立即改到真实生效的 Limiter 上（0 = 不限制）
+                        limiter.set_speed_limit(speed_limit(bit));
                     }
                 }
             } else {
-                res = format!(
-                    "{}Mb/s\n",
-                    TOTAL_BANDWIDTH.load(Ordering::SeqCst) as f64 / 1024. / 1024.
-                );
+                res = format!("{}\n", fmt_speed(TOTAL_BANDWIDTH.load(Ordering::SeqCst)));
             }
         }
         Some("single-bandwidth" | "sb") => {
             if let Some(v) = fds.next() {
                 if let Ok(v) = v.parse::<f64>() {
-                    if v > 0. {
+                    if v >= 0. {
                         SINGLE_BANDWIDTH.store((v * 1024. * 1024.) as _, Ordering::SeqCst);
                     }
                 }
             } else {
-                res = format!(
-                    "{}Mb/s\n",
-                    SINGLE_BANDWIDTH.load(Ordering::SeqCst) as f64 / 1024. / 1024.
-                );
+                res = format!("{}\n", fmt_speed(SINGLE_BANDWIDTH.load(Ordering::SeqCst)));
             }
         }
         Some("usage" | "u") => {
@@ -359,12 +402,31 @@ async fn check_cmd(cmd: &str, limiter: Limiter) -> String {
     res
 }
 
-/// Track active connections for load reporting to hbbs.
+/// hbbr 当前活跃连接数（含等待配对/状态查询的短连接）。
+///
+/// 由 io_loop 在 accept 时 +1、连接结束（含异常路径）时 -1。
+/// 消费者是 node_agent 心跳：通过 [`active_conns`] 注册 getter，**不再往
+/// node_agent::ACTIVE_CONNS 里镜像**（镜像只在 accept 时递增、连接关闭时漏减，
+/// 导致 sessions 只增不减）。
 static ACTIVE_CONNS: AtomicUsize = AtomicUsize::new(0);
+
+/// 供 `node_agent::set_conns_getter` 注册的取值函数（必须是无捕获的 fn）。
+pub fn active_conns() -> usize {
+    ACTIVE_CONNS.load(Ordering::Relaxed)
+}
 
 async fn io_loop(listener: TcpListener, listener2: TcpListener, key: &str) {
     check_params();
-    let limiter = <Limiter>::new(TOTAL_BANDWIDTH.load(Ordering::SeqCst) as _);
+    // 总带宽限速器只创建一次并登记到 LIMITER；io_loop 因监听异常重启时复用同一实例，
+    // 这样 api-server 热更新的 set_speed_limit 不会因为重建 Limiter 而丢失。
+    let limiter = match LIMITER.get() {
+        Some(l) => l.clone(),
+        None => {
+            let l = <Limiter>::new(speed_limit(TOTAL_BANDWIDTH.load(Ordering::Relaxed)));
+            let _ = LIMITER.set(l.clone());
+            l
+        }
+    };
     loop {
         tokio::select! {
             res = listener.accept() => {
@@ -372,7 +434,6 @@ async fn io_loop(listener: TcpListener, listener2: TcpListener, key: &str) {
                     Ok((stream, addr))  => {
                         stream.set_nodelay(true).ok();
                         ACTIVE_CONNS.fetch_add(1, Ordering::Relaxed);
-        crate::node_agent::ACTIVE_CONNS.store(ACTIVE_CONNS.load(Ordering::Relaxed), Ordering::Relaxed);
                         handle_connection(stream, addr, &limiter, key, false).await;
                     }
                     Err(err) => {
@@ -386,7 +447,6 @@ async fn io_loop(listener: TcpListener, listener2: TcpListener, key: &str) {
                     Ok((stream, addr))  => {
                         stream.set_nodelay(true).ok();
                         ACTIVE_CONNS.fetch_add(1, Ordering::Relaxed);
-        crate::node_agent::ACTIVE_CONNS.store(ACTIVE_CONNS.load(Ordering::Relaxed), Ordering::Relaxed);
                         handle_connection(stream, addr, &limiter, key, true).await;
                     }
                     Err(err) => {
@@ -537,11 +597,20 @@ async fn relay(
     let mut highest_s = 0;
     let mut downgrade: bool = false;
     let mut blacked: bool = false;
-    let sb = SINGLE_BANDWIDTH.load(Ordering::SeqCst) as f64;
-    let limiter = <Limiter>::new(sb);
-    let blacklist_limiter = <Limiter>::new(LIMIT_SPEED.load(Ordering::SeqCst) as _);
-    let downgrade_threshold =
-        (sb * DOWNGRADE_THRESHOLD_100.load(Ordering::SeqCst) as f64 / 100. / 1000.) as usize; // in bit/ms
+    // 单连接 / 黑名单 / 降级限速都在连接建立时读取原子量：
+    // api-server 的热更新**只对新连接生效**，已建立的中继连接不会中途改速。
+    let sb = SINGLE_BANDWIDTH.load(Ordering::Relaxed);
+    let limiter = <Limiter>::new(speed_limit(sb));
+    let blacklist_limiter = <Limiter>::new(speed_limit(LIMIT_SPEED.load(Ordering::Relaxed)));
+    // 自动降级用固定惩罚带宽，不复用 LIMIT_SPEED（见 DOWNGRADE_LIMIT_SPEED 的说明）
+    let downgrade_limiter = <Limiter>::new(DOWNGRADE_LIMIT_SPEED as f64);
+    // 阈值单位 bit/ms：单连接不限速（sb=0）时没有比较基准，直接关闭自动降级，
+    // 避免把"不限制"当成 0 阈值导致所有连接一上来就被降级。
+    let downgrade_threshold = if sb == 0 {
+        0
+    } else {
+        (sb as f64 * DOWNGRADE_THRESHOLD_100.load(Ordering::Relaxed) as f64 / 100. / 1000.) as usize
+    };
     let mut timer = interval(Duration::from_secs(3));
     let mut last_recv_time = std::time::Instant::now();
     loop {
@@ -550,8 +619,10 @@ async fn relay(
                 if let Some(Ok(bytes)) = res {
                     last_recv_time = std::time::Instant::now();
                     let nb = bytes.len() * 8;
-                    if blacked || downgrade {
+                    if blacked {
                         blacklist_limiter.consume(nb).await;
+                    } else if downgrade {
+                        downgrade_limiter.consume(nb).await;
                     } else {
                         limiter.consume(nb).await;
                     }
@@ -569,8 +640,10 @@ async fn relay(
                 if let Some(Ok(bytes)) = res {
                     last_recv_time = std::time::Instant::now();
                     let nb = bytes.len() * 8;
-                    if blacked || downgrade {
+                    if blacked {
                         blacklist_limiter.consume(nb).await;
+                    } else if downgrade {
+                        downgrade_limiter.consume(nb).await;
                     } else {
                         limiter.consume(nb).await;
                     }
@@ -609,16 +682,22 @@ async fn relay(
                 (elapsed as _, total as _, highest_s as _, speed as _),
             );
             total_s = 0;
-            if elapsed > DOWNGRADE_START_CHECK.load(Ordering::SeqCst)
+            // 降级判定：阈值 0（关闭）或检查窗口 0（关闭）时不做降级；
+            // saturating_mul 防止阈值/耗时很大时 usize 溢出回绕成假触发。
+            let check_ms = DOWNGRADE_START_CHECK.load(Ordering::Relaxed);
+            if check_ms > 0
+                && downgrade_threshold > 0
                 && !downgrade
-                && total > elapsed * downgrade_threshold
+                && elapsed > check_ms
+                && total > elapsed.saturating_mul(downgrade_threshold)
             {
                 downgrade = true;
                 log::info!(
-                    "Downgrade {}, exceed downgrade threshold {}bit/ms in {}ms",
+                    "Downgrade {}, exceed downgrade threshold {}bit/ms in {}ms (penalty {}Mb/s)",
                     id,
                     downgrade_threshold,
-                    elapsed
+                    elapsed,
+                    DOWNGRADE_LIMIT_SPEED / 1024 / 1024
                 );
             }
         }

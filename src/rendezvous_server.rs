@@ -134,6 +134,18 @@ const CHECK_RELAY_TIMEOUT: u64 = 3_000;
 static ALWAYS_USE_RELAY: AtomicBool = AtomicBool::new(false);
 static MUST_LOGIN: AtomicBool = AtomicBool::new(false);
 
+/// 在线 peer 数（最近 REG_TIMEOUT 内有注册/心跳）。
+///
+/// 由 io_loop 每 3s 从 PeerMap 刷新一次；集群 agent 心跳通过 [`online_peers`]
+/// 注册的 getter 实时读取。原实现里 `node_agent::ONLINE_PEERS` 从未被写入，
+/// hbbs 上报的 peers 恒为 0。
+static ONLINE_PEERS: AtomicUsize = AtomicUsize::new(0);
+
+/// 供 `node_agent::set_peers_getter` 注册的取值函数（必须是无捕获的 fn）。
+pub fn online_peers() -> usize {
+    ONLINE_PEERS.load(Ordering::Relaxed)
+}
+
 #[derive(Clone)]
 struct Inner {
     serial: i32,
@@ -344,6 +356,8 @@ impl RendezvousServer {
         loop {
             tokio::select! {
                 _ = timer_check_relay.tick() => {
+                    // 刷新在线 peer 数（供 node_agent 心跳上报）。成本 = 一把 map 读锁 + 若干 try_read。
+                    ONLINE_PEERS.store(self.pm.online_count(REG_TIMEOUT).await, Ordering::Relaxed);
                     if self.relay_servers0.len() > 1 {
                         let rs = self.relay_servers0.clone();
                         let tx = self.tx.clone();
