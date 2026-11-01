@@ -17,7 +17,7 @@ on:
       - 'v[0-9]+.[0-9]+.[0-9]+'
 
 permissions:
-  contents: read
+  contents: write
   packages: write
 
 env:
@@ -98,3 +98,47 @@ jobs:
           tags: |
             ghcr.io/${{ github.repository }}-hbbr:${{ github.ref_name }}-${{ matrix.job.arch }}
             ghcr.io/${{ github.repository }}-hbbr:latest-${{ matrix.job.arch }}
+
+      - name: Publish binaries to GitHub Release
+        if: startsWith(github.ref, 'refs/tags/') && matrix.job.arch == 'amd64'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: ${{ github.ref_name }}
+          body: |
+            RustDesk 自建服务端（定制版）${{ github.ref_name }}
+
+            ## 二进制
+            - `hbbs` —— ID/会合服务器（21115/21116/21118）
+            - `hbbr` —— 中继服务器（21117/21119）
+            - `rustdesk-utils` —— 辅助工具
+
+            均为 musl 静态链接，可直接在主流 Linux 发行版运行。
+
+            ## Docker 镜像
+            ```
+            docker pull ghcr.io/${{ github.repository }}-hbbs:${{ github.ref_name }}-amd64
+            docker pull ghcr.io/${{ github.repository }}-hbbr:${{ github.ref_name }}-amd64
+            ```
+
+            ## 启动示例（含集群 agent）
+            ```
+            # hbbs
+            RD_API_SERVER=https://<api-server> RD_NODE_KEY=<key> \
+            RD_NODE_ADDR=<公网IP>:21116 RD_NODE_LAN_ADDR=<内网IP>:21116 \
+            RD_NODE_REGION=GX ./hbbs -r "relay1:21117,relay2:21117" --must-login Y
+
+            # hbbr
+            RD_API_SERVER=https://<api-server> RD_NODE_KEY=<key> \
+            RD_NODE_ADDR=<公网IP>:21117 RD_NODE_LAN_ADDR=<内网IP>:21117 \
+            RD_NODE_REGION=GX ./hbbr -k <key>
+            ```
+
+            环境变量 `RD_API_SERVER` 为空时集群功能自动关闭，行为与原始版本一致。
+          files: |
+            target/${{ matrix.job.target }}/release/hbbs
+            target/${{ matrix.job.target }}/release/hbbr
+            target/${{ matrix.job.target }}/release/rustdesk-utils
+          fail_on_unmatched_files: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
