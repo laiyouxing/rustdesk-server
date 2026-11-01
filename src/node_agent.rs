@@ -33,7 +33,10 @@ pub static ACTIVE_CONNS: AtomicUsize = AtomicUsize::new(0);
 
 /// 中继列表热更新回调（仅 hbbs 注册）
 type RelayApply = fn(Vec<String>) -> bool;
+/// 限速热更新回调（仅 hbbr 注册）
+type LimitsApply = fn(usize, usize, usize, usize, usize);
 static RELAY_APPLY: once_cell::sync::OnceCell<RelayApply> = once_cell::sync::OnceCell::new();
+static LIMITS_APPLY: once_cell::sync::OnceCell<LimitsApply> = once_cell::sync::OnceCell::new();
 
 static STARTED: std::sync::Once = std::sync::Once::new();
 
@@ -41,10 +44,17 @@ static STARTED: std::sync::Once = std::sync::Once::new();
 const HEARTBEAT_SECS: u64 = 15;
 /// 拉取中继列表间隔
 const RELAY_PULL_SECS: u64 = 60;
+/// 拉取 api-server 下发配置的间隔
+const CONFIG_PULL_SECS: u64 = 30;
 
 /// 注册中继列表热更新回调（hbbs 启动时调用）。
 pub fn set_relay_apply(f: RelayApply) {
     let _ = RELAY_APPLY.set(f);
+}
+
+/// 注册限速热更新回调（hbbr 启动时调用）。
+pub fn set_limits_apply(f: LimitsApply) {
+    let _ = LIMITS_APPLY.set(f);
 }
 
 fn env_or(k: &str, d: &str) -> String {
@@ -171,6 +181,7 @@ fn run(
     let started = Instant::now();
     let mut registered = false;
     let mut last_pull = Instant::now() - Duration::from_secs(RELAY_PULL_SECS);
+    let mut last_cfg = Instant::now() - Duration::from_secs(CONFIG_PULL_SECS);
 
     loop {
         if !registered {
@@ -210,6 +221,12 @@ fn run(
         if !post_json(&client, &format!("{}/api/node/heartbeat", api), key, &hb) {
             // 心跳失败多为 api-server 重启或网络抖动：下一轮重新注册
             registered = false;
+        }
+
+        // 每 30 秒拉一次 api-server 下发的配置并热应用（中继列表 / 限速）
+        if last_cfg.elapsed() >= Duration::from_secs(CONFIG_PULL_SECS) {
+            last_cfg = Instant::now();
+            pull_and_apply_config(&client, api, key, &node_id);
         }
 
         if pull_relays && last_pull.elapsed() >= Duration::from_secs(RELAY_PULL_SECS) {
@@ -268,5 +285,95 @@ fn pull_and_apply_relays(client: &reqwest::blocking::Client, api: &str, key: &st
             }
         }
         None => log::info!("[node-agent] 本进程未注册中继热更新回调，跳过"),
+    }
+}
+/// 拉取 api-server 下发的节点配置并热应用。
+///
+/// 支持热改的项：
+///   - `relay_servers`（hbbs）→ 通过内部通道替换中继列表
+///   - `limit_speed_mbps` / `single_bandwidth_mbps` / `total_bandwidth_mbps` /
+///     `downgrade_threshold` / `downgrade_start_check_sec`（hbbr）→ 更新运行时原子量
+///
+/// 其余启动参数（key / port / mask / must_login）**无法热改**，由后台仅做展示，
+/// 这里遇到会打印提示而不是假装成功。
+fn pull_and_apply_config(
+    client: &reqwest::blocking::Client,
+    api: &str,
+    key: &str,
+    node_id: &str,
+) {
+    let url = format!("{}/api/node/config?node_id={}", api, node_id);
+    let mut req = client.get(&url);
+    if !key.is_empty() {
+        req = req.header("X-Rustdesk-Key", key);
+    }
+    let resp = match req.send() {
+        Ok(r) => r,
+        Err(e) => {
+            log::debug!("[node-agent] 拉取节点配置失败: {}", e);
+            return;
+        }
+    };
+    let v: serde_json::Value = match resp.json() {
+        Ok(v) => v,
+        Err(_) => return,
+    };
+    let cfg_str = v["data"]["config"].as_str().unwrap_or("");
+    if cfg_str.trim().is_empty() {
+        return;
+    }
+    let cfg: serde_json::Value = match serde_json::from_str(cfg_str) {
+        Ok(c) => c,
+        Err(e) => {
+            log::warn!("[node-agent] 节点配置 JSON 非法: {}", e);
+            return;
+        }
+    };
+
+    // 1) 中继列表（hbbs 热更新）
+    if let Some(list) = cfg["relay_servers"].as_array() {
+        let addrs: Vec<String> = list
+            .iter()
+            .filter_map(|x| x.as_str().map(|s| s.to_string()))
+            .filter(|s| !s.is_empty())
+            .collect();
+        if !addrs.is_empty() {
+            if let Some(f) = RELAY_APPLY.get() {
+                if f(addrs.clone()) {
+                    log::info!("[node-agent] 已按平台下发更新中继列表: {:?}", addrs);
+                }
+            }
+        }
+    }
+
+    // 2) hbbr 限速与降级（热更新）
+    if let Some(f) = LIMITS_APPLY.get() {
+        let mbps = |k: &str| -> usize {
+            cfg[k].as_u64().unwrap_or(0) as usize * 1024 * 1024
+        };
+        let limit = mbps("limit_speed_mbps");
+        let single = mbps("single_bandwidth_mbps");
+        let total = mbps("total_bandwidth_mbps");
+        let threshold = cfg["downgrade_threshold"]
+            .as_f64()
+            .map(|x| (x * 100.0).round() as usize)
+            .unwrap_or(0);
+        let check_ms = cfg["downgrade_start_check_sec"]
+            .as_u64()
+            .map(|x| (x * 1000) as usize)
+            .unwrap_or(0);
+        if limit + single + total + threshold + check_ms > 0 {
+            f(limit, single, total, threshold, check_ms);
+        }
+    }
+
+    // 3) 启动参数类：无法热改，明确提示而不是静默忽略
+    for k in ["key", "port", "mask", "must_login"] {
+        if cfg.get(k).map(|x| !x.is_null()).unwrap_or(false) {
+            log::warn!(
+                "[node-agent] 配置项 {} 属于启动参数，热更新不生效，需重启进程后由启动参数决定",
+                k
+            );
+        }
     }
 }

@@ -42,6 +42,42 @@ static DOWNGRADE_START_CHECK: AtomicUsize = AtomicUsize::new(1_800_000); // in m
 static LIMIT_SPEED: AtomicUsize = AtomicUsize::new(32 * 1024 * 1024); // in bit/s
 static TOTAL_BANDWIDTH: AtomicUsize = AtomicUsize::new(1024 * 1024 * 1024); // in bit/s
 static SINGLE_BANDWIDTH: AtomicUsize = AtomicUsize::new(128 * 1024 * 1024); // in bit/s
+
+/// 供集群 agent 热更新限速与降级参数（api-server 下发，立即生效，无需重启）。
+///
+/// 参数单位：bandwidth 为 bit/s；downgrade_threshold_100 为百分比整数（66 = 0.66）；
+/// downgrade_start_check_ms 为毫秒。传 0 表示该项保持不变。
+pub fn apply_limits(
+    limit_speed: usize,
+    single_bandwidth: usize,
+    total_bandwidth: usize,
+    downgrade_threshold_100: usize,
+    downgrade_start_check_ms: usize,
+) {
+    if limit_speed > 0 {
+        LIMIT_SPEED.store(limit_speed, Ordering::Relaxed);
+    }
+    if single_bandwidth > 0 {
+        SINGLE_BANDWIDTH.store(single_bandwidth, Ordering::Relaxed);
+    }
+    if total_bandwidth > 0 {
+        TOTAL_BANDWIDTH.store(total_bandwidth, Ordering::Relaxed);
+    }
+    if downgrade_threshold_100 > 0 {
+        DOWNGRADE_THRESHOLD_100.store(downgrade_threshold_100, Ordering::Relaxed);
+    }
+    if downgrade_start_check_ms > 0 {
+        DOWNGRADE_START_CHECK.store(downgrade_start_check_ms, Ordering::Relaxed);
+    }
+    log::info!(
+        "[node-agent] 已应用限速配置: LIMIT_SPEED={}Mb/s SINGLE={}Mb/s TOTAL={}Mb/s THRESHOLD={}% CHECK={}ms",
+        LIMIT_SPEED.load(Ordering::Relaxed) / 1024 / 1024,
+        SINGLE_BANDWIDTH.load(Ordering::Relaxed) / 1024 / 1024,
+        TOTAL_BANDWIDTH.load(Ordering::Relaxed) / 1024 / 1024,
+        DOWNGRADE_THRESHOLD_100.load(Ordering::Relaxed),
+        DOWNGRADE_START_CHECK.load(Ordering::Relaxed),
+    );
+}
 const BLACKLIST_FILE: &str = "blacklist.txt";
 const BLOCKLIST_FILE: &str = "blocklist.txt";
 

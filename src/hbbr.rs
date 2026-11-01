@@ -25,6 +25,10 @@ fn main() -> ResultType<()> {
         .args_from_usage(&args)
         .get_matches();
     // 集群 agent：注册到 api-server 并定期上报活跃连接数
+    // 注册限速热更新回调，使 api-server 下发的限速配置能立即生效
+    node_agent::set_limits_apply(|limit, single, total, threshold, check_ms| {
+        relay_server::apply_limits(limit, single, total, threshold, check_ms);
+    });
     node_agent::start("hbbr", "127.0.0.1:21117");
     if let Ok(v) = ini::Ini::load_from_file(".env") {
         if let Some(section) = v.section(None::<String>) {
