@@ -1,4 +1,4 @@
-﻿use crate::common::*;
+use crate::common::*;
 use crate::peer::*;
 use hbb_common::bytes::BufMut;
 use hbb_common::{
@@ -71,8 +71,8 @@ pub fn set_relay_update_tx(tx: mpsc::UnboundedSender<Data>) {
 
 /// 供集群 agent 调用：把调度后的中继列表热更新到正在运行的 hbbs，无需重启。
 ///
-/// 走与启动时相同的 parse_relay_servers 路径，因此 elay_servers0
-/// （健康检查基准）与 elay_servers（实际下发）会一起更新。
+/// 走与启动时相同的 parse_relay_servers 路径，因此 elay_servers0
+/// （健康检查基准）与 elay_servers（实际下发）会一起更新。
 pub fn apply_relay_list(list: Vec<String>) -> bool {
     if list.is_empty() {
         return false;

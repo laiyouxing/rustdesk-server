@@ -1,4 +1,4 @@
-﻿use clap::App;
+use clap::App;
 mod common;
 mod relay_server;
 use flexi_logger::*;
