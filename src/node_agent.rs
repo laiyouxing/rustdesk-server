@@ -191,7 +191,7 @@ fn run(
 
         if pull_relays && last_pull.elapsed() >= Duration::from_secs(RELAY_PULL_SECS) {
             last_pull = Instant::now();
-            pull_and_apply_relays(&client, api, key, region);
+            pull_and_apply_relays(&client, api, key, "");
         }
 
         std::thread::sleep(Duration::from_secs(HEARTBEAT_SECS));
