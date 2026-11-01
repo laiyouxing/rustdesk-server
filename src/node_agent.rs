@@ -77,7 +77,13 @@ pub fn start(kind: &'static str, default_addr: &'static str) {
             return;
         }
         let key = env_or("RD_NODE_KEY", "");
-        let addr = env_or("RD_NODE_ADDR", default_addr);
+        let default_port: u16 = if kind == "hbbr" { 21117 } else { 21116 };
+        let mut addr = env_or("RD_NODE_ADDR", "");
+        if addr.is_empty() {
+            // 未显式配置：尝试自动探测公网 IP（避免手工填错，之前就填错过一次）
+            addr = detect_public_addr(default_port).unwrap_or_else(|| default_addr.to_string());
+            log::info!("[node-agent] RD_NODE_ADDR 未配置，自动探测得到 addr={}", addr);
+        }
         let lan_addr = env_or("RD_NODE_LAN_ADDR", "");
         let region = env_or("RD_NODE_REGION", "");
         let name = env_or("RD_NODE_NAME", "");
@@ -96,6 +102,23 @@ pub fn start(kind: &'static str, default_addr: &'static str) {
     });
 }
 
+/// 探测本机公网 IP（用于在未显式配置 RD_NODE_ADDR 时自动生成对外地址）。
+///
+/// 说明：agent 与 api-server 同机时走 127.0.0.1，api-server 只能看到回环地址，
+/// 因此无法由 api-server 反推公网 IP，这里改用外部回显服务探测。
+/// 探测失败则退回 RD_NODE_ADDR（若配了）或内网地址，绝不阻塞启动。
+fn detect_public_addr(port: u16) -> Option<String> {
+    let url = env_or("RD_PUBLIC_IP_URL", "https://ifconfig.me/ip");
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .ok()?;
+    let ip = client.get(&url).send().ok()?.text().ok()?.trim().to_string();
+    if ip.is_empty() || ip.len() > 45 || ip.contains('<') {
+        return None;
+    }
+    Some(format!("{}:{}", ip, port))
+}
 fn build_client() -> Option<reqwest::blocking::Client> {
     reqwest::blocking::Client::builder()
         // api-server 多用自签名证书（IP:端口），与客户端行为保持一致
