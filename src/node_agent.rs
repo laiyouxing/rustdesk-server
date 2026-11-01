@@ -685,14 +685,17 @@ fn run(
             // 由各进程注册的 getter 实时取值（不再用只增不减的镜像原子量）。
             let peers = PEERS_GETTER.get().map_or(0, |f| f());
             let sessions = CONNS_GETTER.get().map_or(0, |f| f());
+            // CPU / 内存 / 带宽：从 /proc 采样。首次调用只建立基线，
+            // 之后按两次心跳的差值算占用率与速率。
+            let m = sample_metrics();
             let hb = serde_json::json!({
                 "node_id": node_id,
                 "peers": peers,
                 "sessions": sessions,
-                "bw_in": 0,
-                "bw_out": 0,
-                "cpu_pct": 0,
-                "mem_pct": 0,
+                "bw_in": m.bw_in,
+                "bw_out": m.bw_out,
+                "cpu_pct": m.cpu_pct,
+                "mem_pct": m.mem_pct,
                 "uptime_sec": started.elapsed().as_secs(),
                 "version": crate::version::VERSION,
             });
@@ -1011,4 +1014,144 @@ fn pull_and_apply_config(
             );
         }
     }
+}
+
+// ===== 主机指标采集（CPU / 内存 / 带宽）=====
+//
+// 数据来源：Linux 的 /proc。三项都按"两次采样之间的变化"计算，
+// 因此首次调用只会建立基线、返回全 0；之后每次心跳（15s）都会得到真实值。
+//
+// 非 Linux 平台直接返回全 0（该 agent 只服务 Linux 部署）。
+
+/// 一次采样得到的节点负载指标。
+pub struct NodeMetrics {
+    /// 入向带宽，单位 bit/s（api-server 按 1 Gbit/s 归一化）
+    pub bw_in: u64,
+    /// 出向带宽，单位 bit/s
+    pub bw_out: u64,
+    /// CPU 使用率百分比 0~100
+    pub cpu_pct: u64,
+    /// 内存使用率百分比 0~100
+    pub mem_pct: u64,
+}
+
+impl Default for NodeMetrics {
+    fn default() -> Self {
+        Self {
+            bw_in: 0,
+            bw_out: 0,
+            cpu_pct: 0,
+            mem_pct: 0,
+        }
+    }
+}
+
+/// 采样上一次的基准值：(时刻, cpu 总时间, cpu 空闲时间, 网卡 rx 字节, 网卡 tx 字节)
+static METRICS_PREV: once_cell::sync::Lazy<std::sync::Mutex<Option<(std::time::Instant, u64, u64, u64, u64)>>> =
+    once_cell::sync::Lazy::new(|| std::sync::Mutex::new(None));
+
+/// 采样节点负载指标。失败时返回全 0，不影响心跳。
+pub fn sample_metrics() -> NodeMetrics {
+    let mut out = NodeMetrics::default();
+    #[cfg(target_os = "linux")]
+    {
+        let now = std::time::Instant::now();
+        let cpu = read_cpu_times();
+        let net = read_net_bytes();
+        out.mem_pct = read_mem_used_pct().unwrap_or(0);
+        let mut guard = match METRICS_PREV.lock() {
+            Ok(g) => g,
+            Err(_) => return out,
+        };
+        if let Some((prev_t, prev_total, prev_idle, prev_rx, prev_tx)) = *guard {
+            let dt = now.duration_since(prev_t).as_secs_f64();
+            if let (Some((total, idle)), Some((rx, tx))) = (cpu, net) {
+                if dt > 0.5 {
+                    // CPU：1 - 空闲增量/总增量
+                    let d_total = total.saturating_sub(prev_total);
+                    let d_idle = idle.saturating_sub(prev_idle);
+                    if d_total > 0 {
+                        out.cpu_pct = (((d_total - d_idle.min(d_total)) as f64) * 100.0
+                            / d_total as f64)
+                            .round()
+                            .clamp(0.0, 100.0) as u64;
+                    }
+                    // 带宽：字节差 * 8 / 秒 → bit/s
+                    out.bw_in = ((rx.saturating_sub(prev_rx) as f64) * 8.0 / dt) as u64;
+                    out.bw_out = ((tx.saturating_sub(prev_tx) as f64) * 8.0 / dt) as u64;
+                }
+            }
+        }
+        if let (Some((total, idle)), Some((rx, tx))) = (cpu, net) {
+            *guard = Some((now, total, idle, rx, tx));
+        }
+    }
+    out
+}
+
+/// 读 /proc/stat 第一行，返回 (总时间, 空闲时间)，单位 jiffies。
+#[cfg(target_os = "linux")]
+fn read_cpu_times() -> Option<(u64, u64)> {
+    let content = std::fs::read_to_string("/proc/stat").ok()?;
+    let line = content.lines().next()?;
+    let mut it = line.split_whitespace();
+    if it.next()? != "cpu" {
+        return None;
+    }
+    let vals: Vec<u64> = it.filter_map(|x| x.parse::<u64>().ok()).collect();
+    if vals.len() < 4 {
+        return None;
+    }
+    let total: u64 = vals.iter().sum();
+    // 第 4 项是 idle，第 5 项是 iowait；两者都算"空闲"
+    let idle = vals[3] + vals.get(4).copied().unwrap_or(0);
+    Some((total, idle))
+}
+
+/// 读 /proc/net/dev，返回所有非 lo 网卡的 (rx 字节, tx 字节) 累计值。
+#[cfg(target_os = "linux")]
+fn read_net_bytes() -> Option<(u64, u64)> {
+    let content = std::fs::read_to_string("/proc/net/dev").ok()?;
+    let mut rx_total = 0u64;
+    let mut tx_total = 0u64;
+    for line in content.lines().skip(2) {
+        let (name, rest) = match line.split_once(':') {
+            Some(v) => v,
+            None => continue,
+        };
+        let name = name.trim();
+        if name == "lo" {
+            continue;
+        }
+        let fields: Vec<&str> = rest.split_whitespace().collect();
+        if fields.len() < 9 {
+            continue;
+        }
+        // 收包字节在第 1 列，发包字节在第 9 列
+        if let (Ok(rx), Ok(tx)) = (fields[0].parse::<u64>(), fields[8].parse::<u64>()) {
+            rx_total += rx;
+            tx_total += tx;
+        }
+    }
+    Some((rx_total, tx_total))
+}
+
+/// 读 /proc/meminfo 计算内存使用率百分比。
+#[cfg(target_os = "linux")]
+fn read_mem_used_pct() -> Option<u64> {
+    let content = std::fs::read_to_string("/proc/meminfo").ok()?;
+    let mut total = 0u64;
+    let mut avail = 0u64;
+    for line in content.lines() {
+        if let Some(rest) = line.strip_prefix("MemTotal:") {
+            total = rest.split_whitespace().next()?.parse().ok()?;
+        } else if let Some(rest) = line.strip_prefix("MemAvailable:") {
+            avail = rest.split_whitespace().next()?.parse().ok()?;
+        }
+    }
+    if total == 0 {
+        return None;
+    }
+    let used = total.saturating_sub(avail);
+    Some(((used as f64) * 100.0 / total as f64).round().clamp(0.0, 100.0) as u64)
 }
