@@ -1,4 +1,4 @@
-use async_speed_limit::Limiter;
+﻿use async_speed_limit::Limiter;
 use async_trait::async_trait;
 use hbb_common::{
     allow_err, bail,
@@ -336,6 +336,7 @@ async fn io_loop(listener: TcpListener, listener2: TcpListener, key: &str) {
                     Ok((stream, addr))  => {
                         stream.set_nodelay(true).ok();
                         ACTIVE_CONNS.fetch_add(1, Ordering::Relaxed);
+        crate::node_agent::ACTIVE_CONNS.store(ACTIVE_CONNS.load(Ordering::Relaxed), Ordering::Relaxed);
                         handle_connection(stream, addr, &limiter, key, false).await;
                     }
                     Err(err) => {
@@ -349,6 +350,7 @@ async fn io_loop(listener: TcpListener, listener2: TcpListener, key: &str) {
                     Ok((stream, addr))  => {
                         stream.set_nodelay(true).ok();
                         ACTIVE_CONNS.fetch_add(1, Ordering::Relaxed);
+        crate::node_agent::ACTIVE_CONNS.store(ACTIVE_CONNS.load(Ordering::Relaxed), Ordering::Relaxed);
                         handle_connection(stream, addr, &limiter, key, true).await;
                     }
                     Err(err) => {

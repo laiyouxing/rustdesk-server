@@ -58,6 +58,30 @@ enum Data {
 }
 
 const REG_TIMEOUT: i64 = 30_000;
+
+/// 集群 agent 热更新中继列表用的发送端（在 start() 中注入）。
+/// 用 once_cell 而非 OnceLock，兼容较老的 rustc。
+static RELAY_UPDATE_TX: once_cell::sync::OnceCell<mpsc::UnboundedSender<Data>> =
+    once_cell::sync::OnceCell::new();
+
+/// 记录热更新通道（由 RendezvousServer::start() 调用）。
+pub fn set_relay_update_tx(tx: mpsc::UnboundedSender<Data>) {
+    let _ = RELAY_UPDATE_TX.set(tx);
+}
+
+/// 供集群 agent 调用：把调度后的中继列表热更新到正在运行的 hbbs，无需重启。
+///
+/// 走与启动时相同的 parse_relay_servers 路径，因此 elay_servers0
+/// （健康检查基准）与 elay_servers（实际下发）会一起更新。
+pub fn apply_relay_list(list: Vec<String>) -> bool {
+    if list.is_empty() {
+        return false;
+    }
+    match RELAY_UPDATE_TX.get() {
+        Some(tx) => tx.send(Data::RelayServers0(list.join(","))).is_ok(),
+        None => false,
+    }
+}
 type TcpStreamSink = SplitSink<Framed<TcpStream, BytesCodec>, Bytes>;
 type WsSink = SplitSink<tokio_tungstenite::WebSocketStream<TcpStream>, tungstenite::Message>;
 struct SafeWsSink {
@@ -157,6 +181,8 @@ impl RendezvousServer {
         log::info!("Listening on websocket :{}", ws_port);
         let mut socket = create_udp_listener(port, rmem).await?;
         let (tx, mut rx) = mpsc::unbounded_channel::<Data>();
+        // 把发送端交给集群 agent，用于热更新中继列表
+        set_relay_update_tx(tx.clone());
         let software_url = get_arg("software-url");
         let version = hbb_common::get_version_from_url(&software_url);
         if !version.is_empty() {

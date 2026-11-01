@@ -1,9 +1,10 @@
-use clap::App;
+﻿use clap::App;
 mod common;
 mod relay_server;
 use flexi_logger::*;
 use hbb_common::{config::RELAY_PORT, ResultType};
 use relay_server::*;
+mod node_agent;
 mod version;
 
 fn main() -> ResultType<()> {
@@ -23,6 +24,8 @@ fn main() -> ResultType<()> {
         .about("RustDesk Relay Server")
         .args_from_usage(&args)
         .get_matches();
+    // 集群 agent：注册到 api-server 并定期上报活跃连接数
+    node_agent::start("hbbr", "127.0.0.1:21117");
     if let Ok(v) = ini::Ini::load_from_file(".env") {
         if let Some(section) = v.section(None::<String>) {
             section.iter().for_each(|(k, v)| std::env::set_var(k, v));

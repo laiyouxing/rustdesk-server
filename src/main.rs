@@ -1,4 +1,4 @@
-// https://tools.ietf.org/rfc/rfc5128.txt
+﻿// https://tools.ietf.org/rfc/rfc5128.txt
 // https://blog.csdn.net/bytxl/article/details/44344855
 
 use flexi_logger::*;
@@ -26,6 +26,9 @@ fn main() -> ResultType<()> {
         , --must-login=[Y|N] 'Only allow the client with login'",
     );
     init_args(&args, "hbbs", "RustDesk ID/Rendezvous Server");
+    // 集群 agent：注册到 api-server 并定期上报；同时注册中继列表热更新回调
+    node_agent::set_relay_apply(rendezvous_server::apply_relay_list);
+    node_agent::start("hbbs", "127.0.0.1:21116");
     let port = get_arg_or("port", RENDEZVOUS_PORT.to_string()).parse::<i32>()?;
     if port < 3 {
         bail!("Invalid port");
