@@ -27,6 +27,19 @@
 //!   RD_NODE_REGION   地域标识（可选，省级 code，例如 GX）
 //!   RD_NODE_NAME     节点显示名（可选）
 //!   RD_RELAY_PULL    是否拉取中继列表；hbbs 默认 true、hbbr 默认 false
+//!
+//! 节点密钥的来源与轮换（`X-Node-Secret`）：
+//!   - 启动时优先级：`.node_secret` 缓存文件（工作目录 / 二进制所在目录）> `RD_NODE_SECRET`；
+//!     两者都没有则不带该请求头（服务端未启用密钥时仍可工作）。
+//!   - 运行中每 60 秒调一次 `GET /api/node/secret`（需带当前或宽限期内的上一把密钥）：
+//!     服务端返回的密钥与本机不同 → 原子写缓存（先写 `.node_secret.tmp` 再 rename）
+//!     → 更新内存中的当前密钥 → info 日志「节点密钥已更新（服务端下发）」。
+//!   - 服务端未配置 node.secret 时该接口仍返回 200，但 `secret` 为空串：
+//!     **忽略空串、保持本地密钥不变**（否则会把已落盘的密钥清空）。
+//!   - 该接口返回 401 表示本机密钥已超出服务端宽限期（current 与 rotated_at+7 天内的
+//!     prev 都不匹配）：warn 提示检查 api-server 配置，继续用旧密钥重试，不退出线程。
+//!   - 服务端同一时刻只保留一把 prev，因此后台连续轮换的间隔应大于本机 60 秒轮询周期。
+//!   - 密钥明文**不写日志**；缓存文件在 unix 上以 0600 权限落盘。
 
 use hbb_common::log;
 use std::net::{Ipv4Addr, SocketAddr};
@@ -70,6 +83,11 @@ const CONFIG_PULL_SECS: u64 = 30;
 const FIRST_PULL_DELAY_SECS: u64 = 10;
 /// 地址探测失败后的重试间隔
 const ADDR_DETECT_RETRY_SECS: u64 = 300;
+/// 节点密钥轮询间隔（复用现有定时循环，不新增高频请求）
+const SECRET_PULL_SECS: u64 = 60;
+/// 节点密钥缓存文件名：落在工作目录（systemd 的 WorkingDirectory）或二进制所在目录，
+/// 与其它运行时旁路文件一致的落盘方式。
+const NODE_SECRET_FILE: &str = ".node_secret";
 
 /// 注册中继列表热更新回调（hbbs 启动时调用）。
 ///
@@ -138,6 +156,146 @@ fn env_flag(k: &str, d: bool) -> bool {
     }
 }
 
+/// 节点密钥缓存文件的候选路径，优先级：当前工作目录 → 二进制所在目录。
+///
+/// systemd 部署的 WorkingDirectory 是 `/var/lib/rustdesk-server/`，二进制却在
+/// 别的目录（如 `/home/.../amd64/`）：两处都认（读时按顺序找），写时写到读到
+/// 的那一份；都没有文件时默认写工作目录，失败再退回二进制目录。
+fn node_secret_paths() -> Vec<std::path::PathBuf> {
+    let mut paths = Vec::new();
+    if let Ok(cwd) = std::env::current_dir() {
+        paths.push(cwd.join(NODE_SECRET_FILE));
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let p = dir.join(NODE_SECRET_FILE);
+            if !paths.contains(&p) {
+                paths.push(p);
+            }
+        }
+    }
+    paths
+}
+
+/// 判断一个字符串是否“像可用的密钥”：非空、不含空白、长度合理。
+///
+/// 用于挡掉：缓存文件被截断/被编辑器写成多行、服务端下发空串把密钥清空。
+/// 不校验字符集——密钥格式由 api-server 决定，agent 不做多余假设。
+fn is_plausible_secret(s: &str) -> bool {
+    !s.is_empty() && s.len() <= 256 && !s.chars().any(|c| c.is_whitespace())
+}
+
+/// 读取本地缓存的节点密钥，返回（缓存文件路径, 密钥）。
+fn read_secret_file() -> Option<(std::path::PathBuf, String)> {
+    for path in node_secret_paths() {
+        match std::fs::read_to_string(&path) {
+            Ok(raw) => {
+                let secret = raw.trim().to_string();
+                if is_plausible_secret(&secret) {
+                    return Some((path, secret));
+                }
+                log::warn!(
+                    "[node-agent] 节点密钥缓存 {:?} 内容非法（空/含空白/过长），已忽略",
+                    path
+                );
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => log::warn!("[node-agent] 读取节点密钥缓存 {:?} 失败: {}", path, e),
+        }
+    }
+    None
+}
+
+/// 启动时的节点密钥来源：`.node_secret` 缓存文件 > `RD_NODE_SECRET` 环境变量 > 空。
+///
+/// 缓存文件优先于环境变量：管理员在后台轮换密钥后，节点把新密钥落盘，
+/// 之后重启进程也不会退回 systemd 里的旧环境变量值。
+///
+/// 返回值第二项是后续写缓存要用的路径：读到文件则为该文件，否则为候选里的
+/// 第一项（工作目录）。
+fn load_node_secret() -> (String, std::path::PathBuf) {
+    let candidates = node_secret_paths();
+    if let Some((path, secret)) = read_secret_file() {
+        log::info!("[node-agent] 节点密钥来自缓存文件 {:?}", path);
+        return (secret, path);
+    }
+    let path = candidates
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| std::path::PathBuf::from(NODE_SECRET_FILE));
+    let secret = env_or("RD_NODE_SECRET", "");
+    if !secret.is_empty() {
+        log::info!("[node-agent] 节点密钥来自环境变量 RD_NODE_SECRET");
+    }
+    (secret, path)
+}
+
+/// 原子写节点密钥缓存：先写 `.node_secret.tmp`，再 rename 覆盖正式文件。
+///
+/// POSIX 上 rename 覆盖是原子的（读方要么看到旧内容、要么看到新内容，不会读到
+/// 半个密钥）；Windows 上 rename 不能覆盖已存在文件，先删再改名（开发机场景，
+/// 非原子）。unix 上把临时文件权限收紧为 0600——密钥不该让同机其他用户可读。
+fn save_secret_atomic(path: &std::path::Path, secret: &str) -> bool {
+    use std::io::Write;
+    let mut tmp_os = path.as_os_str().to_os_string();
+    tmp_os.push(".tmp");
+    let tmp = std::path::PathBuf::from(tmp_os);
+    let mut file = match std::fs::File::create(&tmp) {
+        Ok(f) => f,
+        Err(e) => {
+            log::warn!("[node-agent] 创建节点密钥临时文件 {:?} 失败: {}", tmp, e);
+            return false;
+        }
+    };
+    let write_res = file
+        .write_all(format!("{}\n", secret).as_bytes())
+        .and_then(|_| file.sync_all());
+    if let Err(e) = write_res {
+        log::warn!("[node-agent] 写节点密钥临时文件 {:?} 失败: {}", tmp, e);
+        let _ = std::fs::remove_file(&tmp);
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600));
+    }
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        // Windows：rename 不能覆盖已存在文件，先删再改名
+        let _ = std::fs::remove_file(path);
+        if let Err(e2) = std::fs::rename(&tmp, path) {
+            log::warn!(
+                "[node-agent] 节点密钥缓存落盘失败 {:?}: {}（重试: {}）",
+                path,
+                e,
+                e2
+            );
+            let _ = std::fs::remove_file(&tmp);
+            return false;
+        }
+    }
+    true
+}
+
+/// 写密钥缓存：优先写已确定的路径，失败则尝试其它候选路径（工作目录 ↔ 二进制目录），
+/// 成功时把 `cache_path` 切到该路径，后续持续写到同一位置。
+fn persist_secret(cache_path: &mut std::path::PathBuf, secret: &str) -> bool {
+    if save_secret_atomic(cache_path, secret) {
+        return true;
+    }
+    for path in node_secret_paths() {
+        if path == *cache_path {
+            continue;
+        }
+        if save_secret_atomic(&path, secret) {
+            log::info!("[node-agent] 节点密钥缓存改写到 {:?}", path);
+            *cache_path = path;
+            return true;
+        }
+    }
+    false
+}
+
 /// 启动节点 agent（每个进程最多一次）。`kind` 为 "hbbs" 或 "hbbr"。
 ///
 /// **不阻塞调用方**：公网地址探测（最多 5s）在 run() 的后台线程里做，
@@ -150,7 +308,8 @@ pub fn start(kind: &'static str) {
             return;
         }
         let key = env_or("RD_NODE_KEY", "");
-        let secret = env_or("RD_NODE_SECRET", "");
+        // 密钥来源：缓存文件 > 环境变量（详见 load_node_secret 的说明）
+        let (secret, secret_path) = load_node_secret();
         let addr = env_or("RD_NODE_ADDR", "");
         let lan_addr = env_or("RD_NODE_LAN_ADDR", "");
         let region = env_or("RD_NODE_REGION", "");
@@ -173,7 +332,17 @@ pub fn start(kind: &'static str) {
         );
         std::thread::spawn(move || {
             run(
-                kind, &api, &key, &secret, &addr, &lan_addr, &region, &name, pull_relays, default_port,
+                kind,
+                &api,
+                &key,
+                secret,
+                secret_path,
+                &addr,
+                &lan_addr,
+                &region,
+                &name,
+                pull_relays,
+                default_port,
             )
         });
     });
@@ -434,7 +603,8 @@ fn run(
     kind: &'static str,
     api: &str,
     key: &str,
-    secret: &str,
+    mut secret: String,
+    mut secret_path: std::path::PathBuf,
     explicit_addr: &str,
     lan_addr: &str,
     region: &str,
@@ -460,6 +630,7 @@ fn run(
     let mut registered = false;
     let mut last_cfg: Option<Instant> = None;
     let mut last_pull: Option<Instant> = None;
+    let mut last_secret: Option<Instant> = None;
 
     loop {
         // 地址未知（探测失败）时按固定间隔重试；探测在后台线程，失败不影响服务
@@ -501,7 +672,7 @@ fn run(
                 &client,
                 &format!("{}/api/node/register", api),
                 key,
-                secret,
+                &secret,
                 &body,
             );
             if registered {
@@ -529,7 +700,7 @@ fn run(
                 &client,
                 &format!("{}/api/node/heartbeat", api),
                 key,
-                secret,
+                &secret,
                 &hb,
             ) {
                 // 心跳失败多为 api-server 重启或网络抖动：下一轮重新注册
@@ -546,7 +717,7 @@ fn run(
             });
         if registered && cfg_due {
             last_cfg = Some(now);
-            pull_and_apply_config(&client, api, key, secret, node_id);
+            pull_and_apply_config(&client, api, key, &secret, node_id);
         }
 
         let pull_due = last_pull.map_or(
@@ -555,11 +726,119 @@ fn run(
         );
         if pull_relays && pull_due {
             last_pull = Some(now);
-            pull_and_apply_relays(&client, api, key, secret);
+            pull_and_apply_relays(&client, api, key, &secret);
+        }
+
+        // 节点密钥轮询：每 60s 一次（复用本定时循环，不新增线程/高频请求）。
+        // 服务端在后台轮换密钥后，节点在这里自动换成新密钥并落盘，无需改 systemd、无需重启。
+        // 与是否已注册无关：注册本身也需要正确密钥，密钥失效时要能尽快恢复。
+        let secret_due = last_secret.map_or(
+            started.elapsed() >= Duration::from_secs(FIRST_PULL_DELAY_SECS),
+            |t| now.duration_since(t) >= Duration::from_secs(SECRET_PULL_SECS),
+        );
+        if secret_due {
+            last_secret = Some(now);
+            pull_and_apply_secret(&client, api, key, &mut secret, &mut secret_path);
         }
 
         std::thread::sleep(Duration::from_secs(HEARTBEAT_SECS));
     }
+}
+
+/// `GET /api/node/secret` 的一次拉取结果。
+enum SecretFetch {
+    /// 服务端密钥与本机一致，无需变更
+    Unchanged,
+    /// 已更新内存中的密钥（并尽量落盘）
+    Updated,
+    /// 401：本机密钥已超出服务端宽限期
+    Unauthorized,
+    /// 其它失败（网络 / 限流 / 响应格式异常）
+    Failed,
+}
+
+/// 拉取服务端当前节点密钥并按需落盘、更新内存（每 60s 一次，同一个 std::thread 内串行调用）。
+///
+/// 契约（与 api-server 严格一致）：
+///   - 请求头 `X-Node-Secret` = 本机当前密钥（服务端在宽限期内也接受上一把）；
+///   - 200：`{"code":0,"data":{"secret":"<当前密钥>","rotated_at":<unix秒>}}`；
+///   - 401：本机密钥已不被接受（宽限期已过）→ warn 后继续用旧密钥重试，**不退出线程**。
+///
+/// 安全：全程不打印密钥明文，只打印「已更新」与缓存文件路径。
+fn pull_and_apply_secret(
+    client: &reqwest::blocking::Client,
+    api: &str,
+    key: &str,
+    current: &mut String,
+    cache_path: &mut std::path::PathBuf,
+) -> SecretFetch {
+    let url = format!("{}/api/node/secret", api);
+    let req = with_auth(client.get(&url), key, current);
+    let resp = match req.send() {
+        Ok(r) => r,
+        Err(e) => {
+            log::debug!("[node-agent] 拉取节点密钥失败: {}", e);
+            return SecretFetch::Failed;
+        }
+    };
+    let status = resp.status();
+    if status == reqwest::StatusCode::UNAUTHORIZED {
+        // 服务端已配置 node.secret，且本机密钥既不是 current、也不在 7 天宽限期内的 prev
+        log::warn!(
+            "[node-agent] 节点密钥已失效，请检查 api-server 配置（宽限期已过，GET /api/node/secret 返回 401）；继续用旧密钥重试"
+        );
+        return SecretFetch::Unauthorized;
+    }
+    if !status.is_success() {
+        log::warn!("[node-agent] 拉取节点密钥返回 {}", status);
+        return SecretFetch::Failed;
+    }
+    let body: serde_json::Value = match resp.json() {
+        Ok(v) => v,
+        Err(e) => {
+            log::warn!("[node-agent] 节点密钥响应解析失败: {}", e);
+            return SecretFetch::Failed;
+        }
+    };
+    // 全站响应格式 {code, message, data}；code != 0 视为业务失败
+    if let Some(code) = body["code"].as_i64() {
+        if code != 0 {
+            log::warn!(
+                "[node-agent] 拉取节点密钥业务失败: code={} msg={}",
+                code,
+                body["message"].as_str().unwrap_or("")
+            );
+            return SecretFetch::Failed;
+        }
+    }
+    let Some(secret) = body["data"]["secret"].as_str().map(str::trim) else {
+        log::warn!("[node-agent] 节点密钥响应缺少 data.secret，已忽略");
+        return SecretFetch::Failed;
+    };
+    // 服务端未配置 node.secret 时仍返回 200，但 secret 为空串：
+    // 必须**保持本地密钥不变**，否则会把已落盘/环境变量里的密钥清空。
+    if secret.is_empty() {
+        log::debug!("[node-agent] 服务端未配置节点密钥（下发空串），保持本地密钥不变");
+        return SecretFetch::Unchanged;
+    }
+    if !is_plausible_secret(secret) {
+        log::warn!("[node-agent] 服务端下发的节点密钥格式非法（含空白/过长），已忽略");
+        return SecretFetch::Failed;
+    }
+    if secret == current.as_str() {
+        return SecretFetch::Unchanged;
+    }
+    // 落盘失败也更新内存：先保证本次运行可用，落盘问题只影响重启后的初值
+    if persist_secret(cache_path, secret) {
+        log::info!(
+            "[node-agent] 节点密钥已更新（服务端下发），缓存文件 {:?}",
+            cache_path
+        );
+    } else {
+        log::warn!("[node-agent] 节点密钥已更新（服务端下发），但缓存落盘失败，仅在内存生效");
+    }
+    *current = secret.to_string();
+    SecretFetch::Updated
 }
 
 /// 拉取调度排序后的中继列表并热更新到 hbbs。

@@ -8,6 +8,10 @@
 #      - 但也意味着**证书链不做校验**，中间人可劫持 agent 上报。
 #    如需严格 TLS：换成带 ca-certificates 的基础镜像（如 alpine），把 CA 证书
 #    放到 /etc/ssl/certs/ 后再关掉 danger_accept_invalid_certs。
+#
+# 节点密钥缓存：agent 把服务端轮换下发的新密钥写到**工作目录**的 `.node_secret`
+# （优先级高于 RD_NODE_SECRET）。容器重建会丢缓存并退回环境变量，因此容器部署
+# 要么保证 RD_NODE_SECRET 是最新值，要么持久化工作目录（如 -w /data -v hbbs-data:/data）。
 # 构建：docker build -f Dockerfile.hbbs -t rustdesk-hbbs:1.1.17 .
 FROM scratch
 COPY hbbs /usr/local/bin/hbbs
