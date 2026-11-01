@@ -1,0 +1,40 @@
+# syntax=docker/dockerfile:1
+#
+# RustDesk hbbr（本仓库定制版）容器镜像
+#
+# 特点：
+#   - 二进制是 musl 静态链接，因此用 alpine 即可（无需 glibc 依赖）
+#   - 内置集群 agent：通过环境变量向 api-server 注册与心跳
+#   - 无状态：不需要挂载任何数据卷（中继本身不存数据）
+#
+# 构建（在包含 hbbr 二进制的目录执行）：
+#   docker build -t rustdesk-hbbr:1.1.17 .
+#
+# 运行（推荐 host 网络，中继要处理 UDP/TCP 大流量）：
+#   docker run -d --name hbbr --restart unless-stopped --network host \
+#     rustdesk-hbbr:1.1.17 \
+#     -k "<与 hbbs 相同的 key>"
+#
+# 带集群 agent 的运行示例：
+#   docker run -d --name hbbr --restart unless-stopped --network host \
+#     -e RD_API_SERVER=https://183.24.70.210:21120 \
+#     -e RD_NODE_KEY=<rustdesk key> \
+#     -e RD_NODE_ADDR=<本机公网IP>:21117 \
+#     -e RD_NODE_LAN_ADDR=10.126.126.5 \
+#     -e RD_NODE_REGION=GX \
+#     rustdesk-hbbr:1.1.17 -k "<key>"
+
+FROM alpine:3.20
+
+# tzdata: 日志时间用本地时区；ca-certificates: agent 访问 https api-server
+RUN apk add --no-cache tzdata ca-certificates \
+    && cp /usr/share/zoneinfo/Asia/Shanghai /etc/localtime \
+    && echo "Asia/Shanghai" > /etc/timezone
+
+COPY hbbr /usr/local/bin/hbbr
+RUN chmod +x /usr/local/bin/hbbr
+
+# 21117 = 中继主端口（TCP），21119 = WebSocket 中继
+EXPOSE 21117 21119
+
+ENTRYPOINT ["/usr/local/bin/hbbr"]

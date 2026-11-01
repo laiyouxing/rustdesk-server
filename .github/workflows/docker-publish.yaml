@@ -1,0 +1,100 @@
+name: Publish docker images (hbbs / hbbr)
+
+# 在 GitHub 上构建 hbbs、hbbr 两个镜像并推送到 ghcr.io。
+#
+# 为什么用 scratch 做基础镜像：二进制是 musl 静态链接，无需 glibc；
+# 镜像只有 6~10MB，且不依赖 Docker Hub（国内网络友好）。
+#
+# 触发：
+#   - 推 X.Y.Z 格式 tag（与其它构建一致）
+#   - 手动 workflow_dispatch
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - '[0-9]+.[0-9]+.[0-9]+'
+      - 'v[0-9]+.[0-9]+.[0-9]+'
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-and-push:
+    name: Build images (${{ matrix.job.name }})
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        job:
+          - { name: amd64, target: x86_64-unknown-linux-musl, arch: amd64 }
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.job.target }}
+
+      - name: Build binaries (cross)
+        uses: actions-rs/cargo@v1
+        with:
+          command: build
+          args: --release --all-features --target=${{ matrix.job.target }}
+          use-cross: true
+
+      - name: Prepare docker context
+        run: |
+          mkdir -p docker/ctx-hbbs docker/ctx-hbbr
+          cp target/${{ matrix.job.target }}/release/hbbs docker/ctx-hbbs/hbbs
+          cp target/${{ matrix.job.target }}/release/hbbr docker/ctx-hbbr/hbbr
+          chmod +x docker/ctx-hbbs/hbbs docker/ctx-hbbr/hbbr
+
+          cat > docker/ctx-hbbs/Dockerfile <<'EOF'
+          FROM scratch
+          COPY hbbs /usr/local/bin/hbbs
+          ENV TZ=Asia/Shanghai
+          EXPOSE 21115 21116 21118
+          ENTRYPOINT ["/usr/local/bin/hbbs"]
+          EOF
+
+          cat > docker/ctx-hbbr/Dockerfile <<'EOF'
+          FROM scratch
+          COPY hbbr /usr/local/bin/hbbr
+          ENV TZ=Asia/Shanghai
+          EXPOSE 21117 21119
+          ENTRYPOINT ["/usr/local/bin/hbbr"]
+          EOF
+
+      - name: Log in to ghcr.io
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push hbbs
+        uses: docker/build-push-action@v6
+        with:
+          context: docker/ctx-hbbs
+          platforms: linux/${{ matrix.job.arch }}
+          push: true
+          tags: |
+            ghcr.io/${{ github.repository }}-hbbs:${{ github.ref_name }}-${{ matrix.job.arch }}
+            ghcr.io/${{ github.repository }}-hbbs:latest-${{ matrix.job.arch }}
+
+      - name: Build and push hbbr
+        uses: docker/build-push-action@v6
+        with:
+          context: docker/ctx-hbbr
+          platforms: linux/${{ matrix.job.arch }}
+          push: true
+          tags: |
+            ghcr.io/${{ github.repository }}-hbbr:${{ github.ref_name }}-${{ matrix.job.arch }}
+            ghcr.io/${{ github.repository }}-hbbr:latest-${{ matrix.job.arch }}

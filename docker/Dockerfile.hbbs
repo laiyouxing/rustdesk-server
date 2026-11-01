@@ -1,0 +1,8 @@
+﻿# syntax=docker/dockerfile:1
+# RustDesk hbbs（本仓库定制版）—— musl 静态二进制，scratch 基础镜像
+# 构建：docker build -f Dockerfile.hbbs -t rustdesk-hbbs:1.1.17 .
+FROM scratch
+COPY hbbs /usr/local/bin/hbbs
+ENV TZ=Asia/Shanghai
+EXPOSE 21115 21116 21118
+ENTRYPOINT ["/usr/local/bin/hbbs"]
