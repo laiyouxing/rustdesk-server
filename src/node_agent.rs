@@ -36,6 +36,15 @@ type RelayApply = fn(Vec<String>) -> bool;
 /// 限速热更新回调（仅 hbbr 注册）
 type LimitsApply = fn(usize, usize, usize, usize, usize);
 static RELAY_APPLY: once_cell::sync::OnceCell<RelayApply> = once_cell::sync::OnceCell::new();
+
+/// 平台（api-server）下发的中继列表。
+///
+/// 优先级：平台下发 > 调度列表 > 本地 -r 启动参数。
+/// Some(..) 表示平台已接管中继列表，此时调度拉取到的列表不再应用，
+/// 避免两者每 30/60 秒互相覆盖（此前是"谁后跑谁生效"，结果不确定）。
+/// 平台配置里去掉 relay_servers 后自动交回调度控制。
+static PLATFORM_RELAYS: once_cell::sync::Lazy<std::sync::Mutex<Option<Vec<String>>>> =
+    once_cell::sync::Lazy::new(|| std::sync::Mutex::new(None));
 static LIMITS_APPLY: once_cell::sync::OnceCell<LimitsApply> = once_cell::sync::OnceCell::new();
 
 static STARTED: std::sync::Once = std::sync::Once::new();
@@ -276,10 +285,15 @@ fn pull_and_apply_relays(client: &reqwest::blocking::Client, api: &str, key: &st
         log::warn!("[node-agent] 调度返回空列表，保留现有中继配置");
         return;
     }
+    // 平台下发优先：平台已指定中继列表时，调度结果不再覆盖
+    if PLATFORM_RELAYS.lock().map(|g| g.is_some()).unwrap_or(false) {
+        log::debug!("[node-agent] 平台配置已接管中继列表，忽略调度结果");
+        return;
+    }
     match RELAY_APPLY.get() {
         Some(f) => {
             if f(addrs.clone()) {
-                log::info!("[node-agent] 已热更新中继列表: {:?}", addrs);
+                log::info!("[node-agent] 已热更新中继列表（调度）: {:?}", addrs);
             } else {
                 log::warn!("[node-agent] 中继列表热更新失败");
             }
@@ -331,6 +345,22 @@ fn pull_and_apply_config(
     };
 
     // 1) 中继列表（hbbs 热更新）
+    // 平台配置里没有 relay_servers（或为空）时，交回调度列表控制
+    let has_platform_relays = cfg["relay_servers"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .any(|x| x.as_str().map(|s| !s.is_empty()).unwrap_or(false))
+        })
+        .unwrap_or(false);
+    if !has_platform_relays {
+        if let Ok(mut g) = PLATFORM_RELAYS.lock() {
+            if g.is_some() {
+                *g = None;
+                log::info!("[node-agent] 平台配置已移除中继列表，交回调度控制");
+            }
+        }
+    }
     if let Some(list) = cfg["relay_servers"].as_array() {
         let addrs: Vec<String> = list
             .iter()
@@ -338,9 +368,16 @@ fn pull_and_apply_config(
             .filter(|s| !s.is_empty())
             .collect();
         if !addrs.is_empty() {
+            // 平台接管：记录并应用，此后调度列表不再覆盖
+            if let Ok(mut g) = PLATFORM_RELAYS.lock() {
+                *g = Some(addrs.clone());
+            }
             if let Some(f) = RELAY_APPLY.get() {
                 if f(addrs.clone()) {
-                    log::info!("[node-agent] 已按平台下发更新中继列表: {:?}", addrs);
+                    log::info!(
+                        "[node-agent] 已按平台下发更新中继列表（平台优先，调度不再覆盖）: {:?}",
+                        addrs
+                    );
                 }
             }
         }
