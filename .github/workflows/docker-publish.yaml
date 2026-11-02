@@ -1,6 +1,7 @@
 name: Publish docker images (hbbs / hbbr)
 
-# 在 GitHub 上构建 hbbs、hbbr 两个镜像并推送到 ghcr.io。
+# 在 GitHub 上构建 hbbs、hbbr 两个镜像并推送到 ghcr.io，
+# 同时产出 Windows 二进制（hbbs.exe / hbbr.exe）挂到 Release。
 #
 # 为什么用 scratch 做基础镜像：二进制是 musl 静态链接，无需 glibc；
 # 镜像只有 6~10MB，且不依赖 Docker Hub（国内网络友好）。
@@ -139,6 +140,42 @@ jobs:
             target/${{ matrix.job.target }}/release/hbbs
             target/${{ matrix.job.target }}/release/hbbr
             target/${{ matrix.job.target }}/release/rustdesk-utils
+          fail_on_unmatched_files: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  build-windows:
+    name: Build Windows binaries
+    runs-on: windows-2022
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Build hbbs / hbbr (Windows)
+        run: cargo build --release --target x86_64-pc-windows-msvc --bin hbbs --bin hbbr
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: binaries-windows-x86_64
+          path: |
+            target/x86_64-pc-windows-msvc/release/hbbs.exe
+            target/x86_64-pc-windows-msvc/release/hbbr.exe
+          if-no-files-found: error
+
+      - name: Publish to GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          files: |
+            target/x86_64-pc-windows-msvc/release/hbbs.exe
+            target/x86_64-pc-windows-msvc/release/hbbr.exe
           fail_on_unmatched_files: false
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -25,7 +25,7 @@ use std::{
     io::prelude::*,
     io::Error,
     net::SocketAddr,
-    sync::atomic::{AtomicUsize, Ordering},
+    sync::atomic::{AtomicU64, AtomicUsize, Ordering},
 };
 
 type Usage = (usize, usize, usize, usize);
@@ -415,6 +415,24 @@ pub fn active_conns() -> usize {
     ACTIVE_CONNS.load(Ordering::Relaxed)
 }
 
+/// 中继累计转发的字节数，供 node_agent 心跳计算带宽。
+///
+/// 不用主机级 `/proc/net/dev`：① Windows 没有 /proc；② 中继要的是"本进程中转了多少"，
+/// 主机网卡总量会被同机其它进程干扰。单位：字节。
+static RELAY_BYTES_IN: AtomicU64 = AtomicU64::new(0); // client → peer
+static RELAY_BYTES_OUT: AtomicU64 = AtomicU64::new(0); // peer → client
+
+/// 供 `node_agent::set_bw_getter` 注册的取值函数（必须是无捕获的 fn）。
+///
+/// 返回累计 `(入向字节, 出向字节)`：入向 = 客户端发往对端，出向 = 对端发回客户端。
+/// 心跳侧用两次采样的差值算 bit/s，所以这里保持单调递增的累计值即可。
+pub fn relay_bytes() -> (u64, u64) {
+    (
+        RELAY_BYTES_IN.load(Ordering::Relaxed),
+        RELAY_BYTES_OUT.load(Ordering::Relaxed),
+    )
+}
+
 async fn io_loop(listener: TcpListener, listener2: TcpListener, key: &str) {
     check_params();
     // 总带宽限速器只创建一次并登记到 LIMITER；io_loop 因监听异常重启时复用同一实例，
@@ -618,7 +636,10 @@ async fn relay(
             res = peer.recv() => {
                 if let Some(Ok(bytes)) = res {
                     last_recv_time = std::time::Instant::now();
-                    let nb = bytes.len() * 8;
+                    let len = bytes.len();
+                    let nb = len * 8;
+                    // 方向：peer → client（对端发回客户端），记入向/出向累计字节
+                    RELAY_BYTES_OUT.fetch_add(len as u64, Ordering::Relaxed);
                     if blacked {
                         blacklist_limiter.consume(nb).await;
                     } else if downgrade {
@@ -639,7 +660,10 @@ async fn relay(
             res = stream.recv() => {
                 if let Some(Ok(bytes)) = res {
                     last_recv_time = std::time::Instant::now();
-                    let nb = bytes.len() * 8;
+                    let len = bytes.len();
+                    let nb = len * 8;
+                    // 方向：client → peer（客户端发往对端）
+                    RELAY_BYTES_IN.fetch_add(len as u64, Ordering::Relaxed);
                     if blacked {
                         blacklist_limiter.consume(nb).await;
                     } else if downgrade {

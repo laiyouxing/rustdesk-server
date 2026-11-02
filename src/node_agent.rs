@@ -53,6 +53,11 @@ type RelayApply = fn(Vec<String>) -> bool;
 type LimitsApply = fn(Option<usize>, Option<usize>, Option<usize>, Option<usize>, Option<usize>);
 /// 指标取值回调（只能注册无捕获的 fn）。
 type CountGetter = fn() -> usize;
+/// 带宽累计字节取值回调（仅 hbbr 注册）：返回累计 (入向字节, 出向字节)。
+///
+/// hbbr 部署在 Windows 时没有 `/proc/net/dev`，改用中继转发循环里累计的字节数；
+/// 语义也比"主机网卡总量"更准（只统计中继自己的流量）。
+type BwGetter = fn() -> (u64, u64);
 
 static RELAY_APPLY: once_cell::sync::OnceCell<RelayApply> = once_cell::sync::OnceCell::new();
 static LIMITS_APPLY: once_cell::sync::OnceCell<LimitsApply> = once_cell::sync::OnceCell::new();
@@ -60,6 +65,8 @@ static LIMITS_APPLY: once_cell::sync::OnceCell<LimitsApply> = once_cell::sync::O
 static CONNS_GETTER: once_cell::sync::OnceCell<CountGetter> = once_cell::sync::OnceCell::new();
 /// hbbs 在线 peer 数 getter（由 rendezvous_server 注册）
 static PEERS_GETTER: once_cell::sync::OnceCell<CountGetter> = once_cell::sync::OnceCell::new();
+/// hbbr 带宽累计字节 getter（由 relay_server 注册）
+static BW_GETTER: once_cell::sync::OnceCell<BwGetter> = once_cell::sync::OnceCell::new();
 
 /// 平台（api-server）下发的中继列表。
 ///
@@ -117,6 +124,15 @@ pub fn set_conns_getter(f: CountGetter) {
 #[allow(dead_code)]
 pub fn set_peers_getter(f: CountGetter) {
     let _ = PEERS_GETTER.set(f);
+}
+
+/// 注册带宽累计字节取值回调（hbbr 启动时传入 `relay_server::relay_bytes`）。
+///
+/// 注册后心跳的 `bw_in` / `bw_out` 用"两次心跳之间的中继转发字节差"算 bit/s；
+/// 未注册（hbbs）时退回 Linux `/proc/net/dev`。hbb 不注册因此显式允许 dead_code。
+#[allow(dead_code)]
+pub fn set_bw_getter(f: BwGetter) {
+    let _ = BW_GETTER.set(f);
 }
 
 /// 读取一个 RD_* 环境变量，兼容下划线与短横线两种写法。
@@ -685,8 +701,9 @@ fn run(
             // 由各进程注册的 getter 实时取值（不再用只增不减的镜像原子量）。
             let peers = PEERS_GETTER.get().map_or(0, |f| f());
             let sessions = CONNS_GETTER.get().map_or(0, |f| f());
-            // CPU / 内存 / 带宽：从 /proc 采样。首次调用只建立基线，
-            // 之后按两次心跳的差值算占用率与速率。
+            // CPU / 内存 / 带宽：跨平台采样（Linux 走 /proc，Windows 走 Win32 API，
+            // 带宽优先用中继自身吞吐计数）。首次调用只建立基线，之后按两次心跳的
+            // 差值算占用率与速率。
             let m = sample_metrics();
             let hb = serde_json::json!({
                 "node_id": node_id,
@@ -1018,10 +1035,14 @@ fn pull_and_apply_config(
 
 // ===== 主机指标采集（CPU / 内存 / 带宽）=====
 //
-// 数据来源：Linux 的 /proc。三项都按"两次采样之间的变化"计算，
-// 因此首次调用只会建立基线、返回全 0；之后每次心跳（15s）都会得到真实值。
+// 跨平台分工：
+//   - CPU：Linux 读 /proc/stat；Windows 调 Win32 `GetSystemTimes`（kernel 时间含 idle）；
+//   - 内存：Linux 读 /proc/meminfo；Windows 调 `GlobalMemoryStatusEx().memory_load`；
+//   - 带宽：优先用「中继自身转发字节数」（hbbr 注册 BW_GETTER，Windows/Linux 都可用，
+//     且只统计本进程流量）；未注册时退回 Linux /proc/net/dev（hbbs 的旧逻辑）。
 //
-// 非 Linux 平台直接返回全 0（该 agent 只服务 Linux 部署）。
+// 三项都按"两次采样之间的变化"计算，因此首次调用只建立基线、返回全 0；
+// 之后每次心跳（15s）都会得到真实值。任何一项采集失败都只让该项为 0，不影响心跳。
 
 /// 一次采样得到的节点负载指标。
 pub struct NodeMetrics {
@@ -1046,46 +1067,66 @@ impl Default for NodeMetrics {
     }
 }
 
-/// 采样上一次的基准值：(时刻, cpu 总时间, cpu 空闲时间, 网卡 rx 字节, 网卡 tx 字节)
-static METRICS_PREV: once_cell::sync::Lazy<std::sync::Mutex<Option<(std::time::Instant, u64, u64, u64, u64)>>> =
+/// CPU 累计时间采样：(总时间, 空闲时间)。单位随平台（Linux jiffies / Windows 100ns），只用于求差。
+type CpuTimes = (u64, u64);
+/// 带宽累计字节采样：(入向字节, 出向字节)。
+type BwBytes = (u64, u64);
+
+/// 上一次采样的基准值。
+struct MetricsBase {
+    at: std::time::Instant,
+    cpu: Option<CpuTimes>,
+    bw: Option<BwBytes>,
+}
+
+static METRICS_PREV: once_cell::sync::Lazy<std::sync::Mutex<Option<MetricsBase>>> =
     once_cell::sync::Lazy::new(|| std::sync::Mutex::new(None));
 
 /// 采样节点负载指标。失败时返回全 0，不影响心跳。
 pub fn sample_metrics() -> NodeMetrics {
+    let now = std::time::Instant::now();
     let mut out = NodeMetrics::default();
-    #[cfg(target_os = "linux")]
-    {
-        let now = std::time::Instant::now();
-        let cpu = read_cpu_times();
-        let net = read_net_bytes();
-        out.mem_pct = read_mem_used_pct().unwrap_or(0);
-        let mut guard = match METRICS_PREV.lock() {
-            Ok(g) => g,
-            Err(_) => return out,
-        };
-        if let Some((prev_t, prev_total, prev_idle, prev_rx, prev_tx)) = *guard {
-            let dt = now.duration_since(prev_t).as_secs_f64();
-            if let (Some((total, idle)), Some((rx, tx))) = (cpu, net) {
-                if dt > 0.5 {
-                    // CPU：1 - 空闲增量/总增量
-                    let d_total = total.saturating_sub(prev_total);
-                    let d_idle = idle.saturating_sub(prev_idle);
-                    if d_total > 0 {
-                        out.cpu_pct = (((d_total - d_idle.min(d_total)) as f64) * 100.0
-                            / d_total as f64)
-                            .round()
-                            .clamp(0.0, 100.0) as u64;
-                    }
-                    // 带宽：字节差 * 8 / 秒 → bit/s
-                    out.bw_in = ((rx.saturating_sub(prev_rx) as f64) * 8.0 / dt) as u64;
-                    out.bw_out = ((tx.saturating_sub(prev_tx) as f64) * 8.0 / dt) as u64;
+    // 平台相关的原始采样：CPU 累计时间、带宽累计字节（采集失败为 None）
+    let cpu = platform_cpu_times();
+    let bw = bw_source_bytes();
+    // 内存是瞬时值，不需要基线
+    out.mem_pct = platform_mem_used_pct().unwrap_or(0);
+
+    let mut guard = match METRICS_PREV.lock() {
+        Ok(g) => g,
+        Err(_) => return out,
+    };
+    if let Some(prev) = guard.as_ref() {
+        let dt = now.duration_since(prev.at).as_secs_f64();
+        if dt > 0.5 {
+            // CPU：busy / total，busy = total - idle
+            if let (Some((total, idle)), Some((prev_total, prev_idle))) = (cpu, prev.cpu) {
+                let d_total = total.saturating_sub(prev_total);
+                let d_idle = idle.saturating_sub(prev_idle);
+                if d_total > 0 {
+                    out.cpu_pct = (((d_total - d_idle.min(d_total)) as f64) * 100.0
+                        / d_total as f64)
+                        .round()
+                        .clamp(0.0, 100.0) as u64;
                 }
             }
-        }
-        if let (Some((total, idle)), Some((rx, tx))) = (cpu, net) {
-            *guard = Some((now, total, idle, rx, tx));
+            // 带宽：字节差 * 8 / 秒 → bit/s
+            if let (Some((cur_in, cur_out)), Some((prev_in, prev_out))) = (bw, prev.bw) {
+                out.bw_in = ((cur_in.saturating_sub(prev_in) as f64) * 8.0 / dt) as u64;
+                out.bw_out = ((cur_out.saturating_sub(prev_out) as f64) * 8.0 / dt) as u64;
+            }
         }
     }
+    // 本轮采集失败的项沿用上一轮基准（下次成功时跨更长时间求差，仍是平均值），
+    // 避免一次读取失败把基线清零、下一轮又白采样一次。
+    let prev = guard.as_ref();
+    let next_cpu = cpu.or_else(|| prev.and_then(|p| p.cpu));
+    let next_bw = bw.or_else(|| prev.and_then(|p| p.bw));
+    *guard = Some(MetricsBase {
+        at: now,
+        cpu: next_cpu,
+        bw: next_bw,
+    });
     out
 }
 
@@ -1154,4 +1195,136 @@ fn read_mem_used_pct() -> Option<u64> {
     }
     let used = total.saturating_sub(avail);
     Some(((used as f64) * 100.0 / total as f64).round().clamp(0.0, 100.0) as u64)
+}
+
+// ----- 平台分派：CPU / 内存 / 带宽 -----
+
+/// CPU 累计时间采样（平台实现）。
+#[cfg(target_os = "linux")]
+fn platform_cpu_times() -> Option<CpuTimes> {
+    read_cpu_times()
+}
+
+#[cfg(target_os = "windows")]
+fn platform_cpu_times() -> Option<CpuTimes> {
+    win_metrics::cpu_times()
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "windows")))]
+fn platform_cpu_times() -> Option<CpuTimes> {
+    None
+}
+
+/// 内存使用率百分比（平台实现）。
+#[cfg(target_os = "linux")]
+fn platform_mem_used_pct() -> Option<u64> {
+    read_mem_used_pct()
+}
+
+#[cfg(target_os = "windows")]
+fn platform_mem_used_pct() -> Option<u64> {
+    win_metrics::mem_used_pct()
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "windows")))]
+fn platform_mem_used_pct() -> Option<u64> {
+    None
+}
+
+/// 带宽累计字节来源：优先「中继自身吞吐」（hbbr 注册了 BW_GETTER），
+/// 否则退回 Linux /proc/net/dev（hbbs 的旧逻辑）；其它平台为 None。
+fn bw_source_bytes() -> Option<BwBytes> {
+    if let Some(f) = BW_GETTER.get() {
+        return Some(f());
+    }
+    platform_net_bytes()
+}
+
+#[cfg(target_os = "linux")]
+fn platform_net_bytes() -> Option<BwBytes> {
+    read_net_bytes()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn platform_net_bytes() -> Option<BwBytes> {
+    None
+}
+
+/// Windows 平台指标：直接调 kernel32，避免为一个百分比引入新依赖。
+#[cfg(target_os = "windows")]
+mod win_metrics {
+    /// `FILETIME`：100ns 间隔，分高低 32 位。
+    #[repr(C)]
+    struct FileTime {
+        low: u32,
+        high: u32,
+    }
+
+    /// `MEMORYSTATUSEX`：字段顺序/宽度必须与 Win32 完全一致。
+    /// 只有 `length` / `memory_load` 会用到，其余字段保留以匹配结构体布局与大小。
+    #[allow(dead_code)]
+    #[repr(C)]
+    struct MemoryStatusEx {
+        length: u32,
+        memory_load: u32,
+        total_phys: u64,
+        avail_phys: u64,
+        total_page_file: u64,
+        avail_page_file: u64,
+        total_virtual: u64,
+        avail_virtual: u64,
+        avail_extended_virtual: u64,
+    }
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetSystemTimes(
+            idle_time: *mut FileTime,
+            kernel_time: *mut FileTime,
+            user_time: *mut FileTime,
+        ) -> i32;
+        fn GlobalMemoryStatusEx(lp_buffer: *mut MemoryStatusEx) -> i32;
+    }
+
+    fn filetime_to_u64(ft: &FileTime) -> u64 {
+        ((ft.high as u64) << 32) | ft.low as u64
+    }
+
+    /// 取系统累计 CPU 时间 `(总时间, 空闲时间)`，单位 100ns。
+    ///
+    /// `GetSystemTimes` 的 kernel 时间**已包含** idle，所以
+    /// `total = kernel + user`、`busy = total - idle`，不能重复加 idle。
+    pub(super) fn cpu_times() -> Option<(u64, u64)> {
+        let mut idle = FileTime { low: 0, high: 0 };
+        let mut kernel = FileTime { low: 0, high: 0 };
+        let mut user = FileTime { low: 0, high: 0 };
+        let ok = unsafe { GetSystemTimes(&mut idle, &mut kernel, &mut user) };
+        if ok == 0 {
+            return None;
+        }
+        let idle = filetime_to_u64(&idle);
+        let kernel = filetime_to_u64(&kernel);
+        let user = filetime_to_u64(&user);
+        Some((kernel.saturating_add(user), idle))
+    }
+
+    /// 取系统内存使用率 0~100（Win32 直接给出整数百分比，无需自己算）。
+    pub(super) fn mem_used_pct() -> Option<u64> {
+        let mut status = MemoryStatusEx {
+            length: std::mem::size_of::<MemoryStatusEx>() as u32,
+            memory_load: 0,
+            total_phys: 0,
+            avail_phys: 0,
+            total_page_file: 0,
+            avail_page_file: 0,
+            total_virtual: 0,
+            avail_virtual: 0,
+            avail_extended_virtual: 0,
+        };
+        let ok = unsafe { GlobalMemoryStatusEx(&mut status) };
+        if ok == 0 {
+            return None;
+        }
+        Some(u64::from(status.memory_load.min(100)))
+    }
 }

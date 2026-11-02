@@ -33,6 +33,8 @@ fn main() -> ResultType<()> {
     node_agent::set_limits_apply(relay_server::apply_limits);
     // 活跃连接数由 relay_server 自己维护，agent 心跳时实时取值（不再镜像到原子量）
     node_agent::set_conns_getter(relay_server::active_conns);
+    // 带宽用「中继自身转发字节数」：Windows 没有 /proc，且这比主机网卡总量更准
+    node_agent::set_bw_getter(relay_server::relay_bytes);
     node_agent::start("hbbr");
     let mut port = RELAY_PORT;
     if let Ok(v) = std::env::var("PORT") {
