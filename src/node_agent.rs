@@ -100,7 +100,7 @@ const SECRET_PULL_SECS: u64 = 60;
 const NODE_SECRET_FILE: &str = ".node_secret";
 /// 上报/探测的内网地址上限：多网卡机器可能列出十几个（Docker 网桥、虚拟网卡），
 /// 截到 8 个避免 register payload 膨胀、api-server 探测耗时线性增长。
-const LAN_ADDR_MAX: usize = 8;
+const LAN_ADDR_MAX: usize = 4;
 
 /// 注册中继列表热更新回调（hbbs 启动时调用）。
 ///
@@ -450,15 +450,28 @@ fn detect_egress_ip(api: &str) -> Option<Ipv4Addr> {
     }
 }
 
-/// 内网候选地址过滤：回环 / 0.0.0.0 / 链路本地（169.254）/ 组播 / 广播都不上报；
-/// **私网地址保留**（这正是要交给 api-server 探测的目标），公网直连网卡也保留。
+/// 内网候选地址过滤：**只保留私网段**。
+///
+/// 为什么要收紧到私网段：这些地址会被 api-server 逐个探测（串行、每个有超时），
+/// 也会被客户端拿去尝试直连。把公网网卡地址、容器/虚拟机网桥（172.17、192.168.x）之外的
+/// 杂项塞进去，只会让"本机不在那个网段"的客户端每次建连都白等一轮探测超时。
+///
+/// 保留范围：10/8、172.16/12、192.168/16，以及运营商大内网 100.64/10（Tailscale
+/// 等组网也用这个段，同组网的客户端与节点之间确实可直连）。
 fn is_usable_lan_ip(ip: Ipv4Addr) -> bool {
-    !(ip.is_loopback()
+    let o = ip.octets();
+    if ip.is_loopback()
         || ip.is_unspecified()
         || ip.is_link_local()
         || ip.is_multicast()
         || ip.is_broadcast()
-        || ip.octets()[0] == 0)
+    {
+        return false;
+    }
+    o[0] == 10
+        || (o[0] == 172 && (16..=31).contains(&o[1]))
+        || (o[0] == 192 && o[1] == 168)
+        || (o[0] == 100 && (64..=127).contains(&o[1]))
 }
 
 /// 把一个 IPv4 追加进内网候选列表（过滤 + 补端口 + 去重 + 上限）。
