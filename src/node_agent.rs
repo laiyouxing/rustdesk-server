@@ -1028,10 +1028,19 @@ fn pull_and_apply_relays(client: &reqwest::blocking::Client, api: &str, key: &st
         log::warn!("[node-agent] 中继列表格式异常");
         return;
     };
+    // 中继列表**只放对外（公网）地址**。
+    //
+    // 内网地址不能摊平进来：客户端选中的中继地址会通过 RequestRelay 原样转发给对端
+    // （hbbs 只改 socket_addr），对端在公网就连不上私有地址了。
+    // 内网优化走客户端侧：它从 api-server 拉「公网 → 内网」映射，
+    // 本机改连内网地址、通告对端的仍是公网地址（同一台 hbbr 按 uuid 配对）。
+    let mut seen = std::collections::HashSet::new();
     let addrs: Vec<String> = list
         .iter()
-        .filter_map(|x| x["addr"].as_str().map(|s| s.to_string()))
-        .filter(|s| !s.is_empty())
+        .filter_map(|x| x["addr"].as_str())
+        .filter(|a| !a.is_empty())
+        .filter(|a| seen.insert(a.to_string()))
+        .map(|a| a.to_string())
         .collect();
     if addrs.is_empty() {
         // 全部节点离线/下线时不覆盖现有配置，避免把中继列表清空导致客户端无中继可用
