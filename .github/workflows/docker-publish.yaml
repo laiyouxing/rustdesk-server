@@ -43,6 +43,15 @@ jobs:
         with:
           targets: ${{ matrix.job.target }}
 
+      - name: Set version from tag
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          # 二进制 `--version` 与节点上报的 version 都取自 Cargo.toml 的 package.version，
+          # 不按 tag 改写就会出现"发的是 1.1.24、后台显示 1.1.16"的错位。
+          VER="${GITHUB_REF_NAME#v}"
+          sed -i "s/^version = \".*\"/version = \"$VER\"/" Cargo.toml
+          grep -m1 '^version' Cargo.toml
+
       - name: Build binaries (cross)
         uses: actions-rs/cargo@v1
         with:
@@ -258,6 +267,15 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: x86_64-pc-windows-msvc
+
+      - name: Set version from tag
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          # 二进制 `--version` 与节点上报的 version 都取自 Cargo.toml 的 package.version，
+          # 不按 tag 改写就会出现"发的是 1.1.24、后台显示 1.1.16"的错位。
+          VER="${GITHUB_REF_NAME#v}"
+          sed -i "s/^version = \".*\"/version = \"$VER\"/" Cargo.toml
+          grep -m1 '^version' Cargo.toml
 
       - name: Build hbbs / hbbr (Windows)
         run: cargo build --release --target x86_64-pc-windows-msvc --bin hbbs --bin hbbr
