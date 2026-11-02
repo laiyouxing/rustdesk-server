@@ -23,7 +23,8 @@
 //!   RD_NODE_SECRET   节点专用密钥，与 api-server 的 node.secret 一致；
 //!                    为空则不带 X-Node-Secret 请求头
 //!   RD_NODE_ADDR     本节点对外地址 host:port（必须是公网 IPv4）
-//!   RD_NODE_LAN_ADDR 本节点内网地址（可选，供同内网客户端直连；**必须带端口**）
+//!   RD_NODE_LAN_ADDR 本节点内网地址（可选；**留空则自动探测**：取本机到 api-server
+//!                    的出口网卡地址并补上本节点端口。显式填写优先，格式 host:port）
 //!   RD_NODE_REGION   地域标识（可选，省级 code，例如 GX）
 //!   RD_NODE_NAME     节点显示名（可选）
 //!   RD_RELAY_PULL    是否拉取中继列表；hbbs 默认 true、hbbr 默认 false
@@ -413,6 +414,43 @@ fn is_forbidden_public_ip(ip: Ipv4Addr) -> bool {
         || (o[0] == 198 && (o[1] == 18 || o[1] == 19))
 }
 
+/// 自动探测本机在「api-server 所在网络」里的内网地址（`ip:端口`）。
+///
+/// 做法是 UDP `connect`（不发包、不握手）：内核按路由表选出一张网卡，
+/// `local_addr()` 拿到的就是这个方向上的本地地址 —— 也正是 api-server
+/// 需要探测、同内网客户端可以直接连的那个地址。
+///
+/// 探测失败或拿到回环地址时返回 `None`，调用方按"没有内网地址"处理：
+/// api-server 会退回去探测公网地址算 RTT，客户端也会实测可达性后再决定用不用，
+/// 所以容器里探到的是容器内网 IP 也不会造成错误调度。
+fn detect_lan_addr(api: &str, default_port: u16) -> Option<String> {
+    let rest = api
+        .trim()
+        .trim_start_matches("https://")
+        .trim_start_matches("http://");
+    let host = rest.split('/').next()?.split(':').next()?.trim();
+    if host.is_empty() {
+        return None;
+    }
+    // 端口只用于让内核算路：UDP 不握手，连不上也无所谓
+    let port = rest
+        .split('/')
+        .next()
+        .and_then(|hp| hp.rsplit(':').next())
+        .and_then(|p| p.parse::<u16>().ok())
+        .unwrap_or(443);
+    let sock = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
+    sock.connect((host, port)).ok()?;
+    let ip = match sock.local_addr().ok()?.ip() {
+        std::net::IpAddr::V4(v4) => v4,
+        _ => return None,
+    };
+    if ip.is_loopback() || ip.is_unspecified() {
+        return None;
+    }
+    Some(format!("{}:{}", ip, default_port))
+}
+
 /// 选择可注册的对外地址（在 agent 线程里调用，失败只 warn、不阻塞服务）。
 ///
 /// 优先级：
@@ -633,8 +671,23 @@ fn run(
         return;
     };
     let started = Instant::now();
+    // 内网地址：显式配置优先；没配就自动探测（失败则为空，不影响注册）。
+    // 统一规范化成 `ip:port`，避免把只有 IP 的配置原样上报给服务端。
+    let lan_addr = match parse_node_addr(lan_addr, default_port) {
+        Some((a, _)) => a,
+        None => match detect_lan_addr(api, default_port) {
+            Some(a) => {
+                log::info!("[node-agent] 自动探测内网地址: {}", a);
+                a
+            }
+            None => String::new(),
+        },
+    };
+    if lan_addr.is_empty() {
+        log::info!("[node-agent] 无内网地址（未配置且自动探测失败），仅上报对外地址");
+    }
     // 地址探测最多阻塞 5s，但只阻塞本线程，不影响 hbbs/hbbr 启动。
-    let mut addr = resolve_node_addr(explicit_addr, lan_addr, default_port);
+    let mut addr = resolve_node_addr(explicit_addr, &lan_addr, default_port);
     let mut last_detect = Instant::now();
     if addr.is_none() {
         log::warn!(
@@ -652,7 +705,7 @@ fn run(
         // 地址未知（探测失败）时按固定间隔重试；探测在后台线程，失败不影响服务
         if addr.is_none() && last_detect.elapsed() >= Duration::from_secs(ADDR_DETECT_RETRY_SECS) {
             last_detect = Instant::now();
-            addr = resolve_node_addr(explicit_addr, lan_addr, default_port);
+            addr = resolve_node_addr(explicit_addr, &lan_addr, default_port);
             if let Some(a) = addr.as_ref() {
                 log::info!("[node-agent] 地址探测成功，开始注册 addr={}", a);
                 node_id = Some(format!("{}@{}", kind, a));
@@ -680,7 +733,7 @@ fn run(
                 "kind": kind,
                 "name": name,
                 "addr": addr,
-                "lan_addr": lan_addr,
+                "lan_addr": lan_addr.as_str(),
                 "region": region,
                 "version": crate::version::VERSION,
             });
