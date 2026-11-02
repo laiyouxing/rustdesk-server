@@ -109,33 +109,136 @@ jobs:
           body: |
             RustDesk 自建服务端（定制版）${{ github.ref_name }}
 
-            ## 二进制
-            - `hbbs` —— ID/会合服务器（21115/21116/21118）
-            - `hbbr` —— 中继服务器（21117/21119）
-            - `rustdesk-utils` —— 辅助工具
+            ## 产物
 
-            均为 musl 静态链接，可直接在主流 Linux 发行版运行。
+            | 文件 | 平台 | 说明 |
+            |---|---|---|
+            | `hbbs` / `hbbr` / `rustdesk-utils` | Linux（musl 静态链接） | 主流发行版直接运行 |
+            | `hbbs.exe` / `hbbr.exe` | Windows x64 | 用 NSSM 注册为服务，见下方「Windows 部署」 |
 
             ## Docker 镜像
+
             ```
             docker pull ghcr.io/laiyouxing/rustdesk-server-hbbs:${{ github.ref_name }}-amd64
             docker pull ghcr.io/laiyouxing/rustdesk-server-hbbr:${{ github.ref_name }}-amd64
             ```
 
-            ## 启动示例（含集群 agent）
+            中继容器必须 `--network host`。
+
+            ## Linux 启动示例（含集群 agent）
+
             ```
             # hbbs
-            RD_API_SERVER=https://<api-server> RD_NODE_KEY=<key> \
-            RD_NODE_ADDR=<公网IP>:21116 RD_NODE_LAN_ADDR=<内网IP>:21116 \
-            RD_NODE_REGION=GX ./hbbs -r "relay1:21117,relay2:21117" --must-login Y
+            RD_API_SERVER=https://<api-server> \
+            RD_NODE_KEY=<KEY> \
+            RD_NODE_SECRET=<节点密钥> \
+            RD_NODE_ADDR=<公网IP>:21116 \
+            RD_NODE_REGION=GX \
+            ./hbbs -r "relay1:21117,relay2:21117" --must-login Y
 
-            # hbbr
-            RD_API_SERVER=https://<api-server> RD_NODE_KEY=<key> \
-            RD_NODE_ADDR=<公网IP>:21117 RD_NODE_LAN_ADDR=<内网IP>:21117 \
-            RD_NODE_REGION=GX ./hbbr -k <key>
+            # hbbr（-k 必须与 hbbs 相同）
+            RD_API_SERVER=https://<api-server> \
+            RD_NODE_KEY=<KEY> \
+            RD_NODE_SECRET=<节点密钥> \
+            RD_NODE_ADDR=<公网IP>:21117 \
+            RD_NODE_REGION=GX \
+            ./hbbr -k <KEY>
             ```
 
             环境变量 `RD_API_SERVER` 为空时集群功能自动关闭，行为与原始版本一致。
+
+            ## Windows 部署（NSSM 管理）
+
+            ### 1. 放文件
+
+            ```cmd
+            mkdir C:\rustdesk-server\logs
+            copy hbbr.exe C:\rustdesk-server\
+            ```
+
+            ### 2. 注册服务
+
+            ```cmd
+            :: -k 必须与 hbbs 一致
+            nssm install RustDeskHbbr "C:\rustdesk-server\hbbr.exe" "-k <KEY>"
+
+            :: 工作目录：集群 agent 会把 .node_secret 缓存在这里，必须可写
+            nssm set RustDeskHbbr AppDirectory "C:\rustdesk-server"
+            ```
+
+            ### 3. 集群 agent 环境变量
+
+            ```cmd
+            nssm set RustDeskHbbr AppEnvironmentExtra ^
+             "RD_API_SERVER=https://<api-server>" ^
+             "RD_NODE_KEY=<KEY>" ^
+             "RD_NODE_SECRET=<节点密钥>" ^
+             "RD_NODE_ADDR=<这台机器的公网IP>:21117" ^
+             "RD_NODE_REGION=GD"
+            ```
+
+            ### 4. 日志与轮转
+
+            ```cmd
+            nssm set RustDeskHbbr AppStdout "C:\rustdesk-server\logs\hbbr.log"
+            nssm set RustDeskHbbr AppStderr "C:\rustdesk-server\logs\hbbr.err.log"
+            nssm set RustDeskHbbr AppRotateFiles 1
+            nssm set RustDeskHbbr AppRotateBytes 10485760
+            nssm set RustDeskHbbr Start SERVICE_AUTO_START
+            nssm start RustDeskHbbr
+            ```
+
+            ### 5. 防火墙
+
+            ```cmd
+            netsh advfirewall firewall add rule name="RustDesk Relay 21117" dir=in action=allow protocol=TCP localport=21117
+            netsh advfirewall firewall add rule name="RustDesk Relay 21119" dir=in action=allow protocol=TCP localport=21119
+            ```
+
+            ### 6. 验证
+
+            ```cmd
+            nssm status RustDeskHbbr
+            type C:\rustdesk-server\logs\hbbr.log
+            ```
+
+            日志应出现：
+
+            ```
+            [node-agent] 自动探测内网地址: 10.0.0.5:21117, 192.168.1.10:21117（共 2 个）
+            [node-agent] 节点已注册: hbbr@<公网IP>:21117
+            ```
+
+            之后在 api-server 后台「集群节点」页能看到这台节点，CPU / 内存 / 带宽均有真实值
+            （Windows 上 CPU 走 `GetSystemTimes`、内存走 `GlobalMemoryStatusEx`、带宽走中继自身字节计数）。
+
+            ### Windows 部署三个易错点
+
+            1. **`RD_NODE_SECRET` 必填** —— 服务端已强制校验，漏了会 401、节点不出现
+            2. **`RD_NODE_ADDR` 填公网 IP**（客户端要用它连中继）；内网地址不用配，
+               agent 会自动探测全部候选（≤4 个，仅私网段）并上报
+            3. **`AppDirectory` 必须可写** —— agent 在那里缓存 `.node_secret`
+
+            ## 内网中继（同内网客户端自动走内网）
+
+            节点会把自身上报的内网地址登记到 api-server：
+            - api-server 探测时逐个尝试全部候选，取延迟最低的写 `rtt_ms`（全不通才记 `-1`）
+            - 客户端 ≥ 1.7.26：选中公网中继后，查 `/api/node/relay-lan-map` 拿到该中继的内网地址，
+              本机改连内网（实测可达且快 ≥5ms 才切），**通告对端的仍是公网地址**；
+              hbbr 按 uuid 配对，两端连同一台 hbbr 的不同地址照样能配对
+            - 需要 api-server ≥ 1.4.28 提供该映射接口
+
+            ## 环境变量
+
+            | 变量 | 说明 |
+            |---|---|
+            | `RD_API_SERVER` | api-server 地址（同机部署用 https://127.0.0.1:21120，公网地址无 NAT 回环） |
+            | `RD_NODE_KEY` | 与 `-k` 相同的 RustDesk key |
+            | `RD_NODE_SECRET` | 节点接入密钥（服务端启用后必填） |
+            | `RD_NODE_ADDR` | 对外地址 `公网IP:端口` |
+            | `RD_NODE_LAN_ADDR` | 可选，显式指定内网地址（`,` 或 `;` 分隔多个）；留空由 agent 自动探测 |
+            | `RD_NODE_REGION` | 地域 code（如 GX / GD） |
+            | `RD_RELAY_PULL` | hbbs 是否拉取调度列表（默认 true），hbbr 默认 false |
           files: |
             target/${{ matrix.job.target }}/release/hbbs
             target/${{ matrix.job.target }}/release/hbbr
