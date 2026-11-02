@@ -23,8 +23,10 @@
 //!   RD_NODE_SECRET   节点专用密钥，与 api-server 的 node.secret 一致；
 //!                    为空则不带 X-Node-Secret 请求头
 //!   RD_NODE_ADDR     本节点对外地址 host:port（必须是公网 IPv4）
-//!   RD_NODE_LAN_ADDR 本节点内网地址（可选；**留空则自动探测**：取本机到 api-server
-//!                    的出口网卡地址并补上本节点端口。显式填写优先，格式 host:port）
+//!   RD_NODE_LAN_ADDR 本节点内网地址（可选；支持 `,` / `;` 分隔多个。**留空则自动探测**：
+//!                    第一个是到 api-server 方向的出口网卡地址，再枚举本机其余网卡的
+//!                    IPv4（业务网 / VPN / Docker 网桥），全部补上本节点端口上报，
+//!                    由 api-server 逐个探测挑选。显式填写优先，格式 host:port）
 //!   RD_NODE_REGION   地域标识（可选，省级 code，例如 GX）
 //!   RD_NODE_NAME     节点显示名（可选）
 //!   RD_RELAY_PULL    是否拉取中继列表；hbbs 默认 true、hbbr 默认 false
@@ -96,6 +98,9 @@ const SECRET_PULL_SECS: u64 = 60;
 /// 节点密钥缓存文件名：落在工作目录（systemd 的 WorkingDirectory）或二进制所在目录，
 /// 与其它运行时旁路文件一致的落盘方式。
 const NODE_SECRET_FILE: &str = ".node_secret";
+/// 上报/探测的内网地址上限：多网卡机器可能列出十几个（Docker 网桥、虚拟网卡），
+/// 截到 8 个避免 register payload 膨胀、api-server 探测耗时线性增长。
+const LAN_ADDR_MAX: usize = 8;
 
 /// 注册中继列表热更新回调（hbbs 启动时调用）。
 ///
@@ -414,16 +419,14 @@ fn is_forbidden_public_ip(ip: Ipv4Addr) -> bool {
         || (o[0] == 198 && (o[1] == 18 || o[1] == 19))
 }
 
-/// 自动探测本机在「api-server 所在网络」里的内网地址（`ip:端口`）。
+/// 用 UDP `connect` 让内核按路由表选出「到 api-server 方向」的出口网卡地址。
 ///
-/// 做法是 UDP `connect`（不发包、不握手）：内核按路由表选出一张网卡，
-/// `local_addr()` 拿到的就是这个方向上的本地地址 —— 也正是 api-server
-/// 需要探测、同内网客户端可以直接连的那个地址。
+/// 不发包、不握手：`connect` 只做一次路由查询，`local_addr()` 拿到的就是这个方向
+/// 上的本地地址 —— 也正是 api-server 最可能探测通、同内网客户端可以直接连的那个。
 ///
-/// 探测失败或拿到回环地址时返回 `None`，调用方按"没有内网地址"处理：
-/// api-server 会退回去探测公网地址算 RTT，客户端也会实测可达性后再决定用不用，
-/// 所以容器里探到的是容器内网 IP 也不会造成错误调度。
-fn detect_lan_addr(api: &str, default_port: u16) -> Option<String> {
+/// 探测失败、拿到回环（同机部署时 api-server 走 127.0.0.1）或 IPv6 时返回 `None`，
+/// 由调用方跳过该候选、退回其它网卡。
+fn detect_egress_ip(api: &str) -> Option<Ipv4Addr> {
     let rest = api
         .trim()
         .trim_start_matches("https://")
@@ -441,14 +444,92 @@ fn detect_lan_addr(api: &str, default_port: u16) -> Option<String> {
         .unwrap_or(443);
     let sock = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
     sock.connect((host, port)).ok()?;
-    let ip = match sock.local_addr().ok()?.ip() {
-        std::net::IpAddr::V4(v4) => v4,
-        _ => return None,
-    };
-    if ip.is_loopback() || ip.is_unspecified() {
-        return None;
+    match sock.local_addr().ok()?.ip() {
+        std::net::IpAddr::V4(v4) if is_usable_lan_ip(v4) => Some(v4),
+        _ => None,
     }
-    Some(format!("{}:{}", ip, default_port))
+}
+
+/// 内网候选地址过滤：回环 / 0.0.0.0 / 链路本地（169.254）/ 组播 / 广播都不上报；
+/// **私网地址保留**（这正是要交给 api-server 探测的目标），公网直连网卡也保留。
+fn is_usable_lan_ip(ip: Ipv4Addr) -> bool {
+    !(ip.is_loopback()
+        || ip.is_unspecified()
+        || ip.is_link_local()
+        || ip.is_multicast()
+        || ip.is_broadcast()
+        || ip.octets()[0] == 0)
+}
+
+/// 把一个 IPv4 追加进内网候选列表（过滤 + 补端口 + 去重 + 上限）。
+fn push_lan_addr(addrs: &mut Vec<String>, ip: Ipv4Addr, default_port: u16) {
+    if addrs.len() >= LAN_ADDR_MAX || !is_usable_lan_ip(ip) {
+        return;
+    }
+    let addr = format!("{}:{}", ip, default_port);
+    if !addrs.contains(&addr) {
+        addrs.push(addr);
+    }
+}
+
+/// 自动探测本机全部候选内网地址（`ip:端口`），交给 api-server 逐个探测挑选。
+///
+/// 顺序：
+///   1. **第一个固定为「到 api-server 方向的出口网卡地址」**（UDP 路由探测，见
+///      [`detect_egress_ip`]）—— 这是历史上唯一上报的那个，服务端优先试它；
+///   2. 再用 `local_ip_address::list_afinet_netifas()` 枚举本机其它网卡上的 IPv4
+///      （业务网 / VPN / Docker 网桥），去重后按枚举顺序追加。
+///
+/// 过滤规则见 [`is_usable_lan_ip`]；全部补 `:<default_port>`；最多 [`LAN_ADDR_MAX`] 个。
+/// 探测失败返回空 Vec，调用方按"没有内网地址"处理（不影响注册，api-server 会退回探测公网地址）。
+fn detect_lan_addrs(api: &str, default_port: u16) -> Vec<String> {
+    let mut addrs: Vec<String> = Vec::new();
+    if let Some(ip) = detect_egress_ip(api) {
+        push_lan_addr(&mut addrs, ip, default_port);
+    }
+    match local_ip_address::list_afinet_netifas() {
+        Ok(list) => {
+            for (_, ip) in list {
+                if let std::net::IpAddr::V4(v4) = ip {
+                    push_lan_addr(&mut addrs, v4, default_port);
+                }
+            }
+        }
+        Err(e) => log::warn!("[node-agent] 枚举本机网卡失败: {}", e),
+    }
+    addrs
+}
+
+/// 解析显式配置的 `RD_NODE_LAN_ADDR`：支持 `,` / `;` 分隔多个地址。
+///
+/// 每个地址都走 [`parse_node_addr`] 规范化（裸 IP 补默认端口、IPv6 拒绝、非法项 warn 跳过），
+/// 回环 / 0.0.0.0 忽略；去重后最多 [`LAN_ADDR_MAX`] 个。
+fn parse_lan_addrs(raw: &str, default_port: u16) -> Vec<String> {
+    let mut addrs: Vec<String> = Vec::new();
+    for item in raw.split(|c| c == ',' || c == ';') {
+        let item = item.trim();
+        if item.is_empty() {
+            continue;
+        }
+        match parse_node_addr(item, default_port) {
+            Some((addr, ip)) if !is_usable_lan_ip(ip) => {
+                log::warn!("[node-agent] RD_NODE_LAN_ADDR={} 是回环/不可用地址，已忽略", addr);
+            }
+            Some((addr, _)) => {
+                if !addrs.contains(&addr) {
+                    addrs.push(addr);
+                }
+                if addrs.len() >= LAN_ADDR_MAX {
+                    break;
+                }
+            }
+            None => log::warn!(
+                "[node-agent] RD_NODE_LAN_ADDR={:?} 不是合法的 IPv4 host:port（已忽略）",
+                item
+            ),
+        }
+    }
+    addrs
 }
 
 /// 选择可注册的对外地址（在 agent 线程里调用，失败只 warn、不阻塞服务）。
@@ -456,7 +537,7 @@ fn detect_lan_addr(api: &str, default_port: u16) -> Option<String> {
 /// 优先级：
 ///   1. 显式 `RD_NODE_ADDR`：必须是公网 IPv4（回环/私网一律拒绝，私网请填 RD_NODE_LAN_ADDR）；
 ///   2. 自动探测公网 IP（`RD_PUBLIC_IP_URL`，默认 ifconfig.me/ip），只接受可解析的 IPv4；
-///   3. 探测失败退回 `RD_NODE_LAN_ADDR`（纯内网/同 VPN 部署时仍可用）；
+///   3. 探测失败退回**第一个内网候选**（显式配置的第一项，或自动探测的出口网卡地址）；
 ///   4. 都没有 → `None`：调用方**暂不注册**并打 warn。
 ///
 /// 历史缺陷：探测失败会兜底 `127.0.0.1:21117`，api-server 里因此出现一台
@@ -487,17 +568,17 @@ fn resolve_node_addr(explicit: &str, lan_addr: &str, default_port: u16) -> Optio
     if !lan_addr.trim().is_empty() {
         match parse_node_addr(lan_addr, default_port) {
             Some((addr, ip)) if ip.is_loopback() || ip.is_unspecified() => {
-                log::warn!("[node-agent] RD_NODE_LAN_ADDR={} 是回环地址，已忽略", addr);
+                log::warn!("[node-agent] 内网地址 {} 是回环地址，已忽略", addr);
             }
             Some((addr, _)) => {
                 log::warn!(
-                    "[node-agent] 对外地址退回 RD_NODE_LAN_ADDR={}（公网探测失败，外部客户端可能连不上）",
+                    "[node-agent] 对外地址退回第一个内网地址 {}（公网探测失败，外部客户端可能连不上）",
                     addr
                 );
                 return Some(addr);
             }
             None => log::warn!(
-                "[node-agent] RD_NODE_LAN_ADDR={:?} 不是合法的 IPv4 host:port（必须带端口，如 10.126.126.5:21117）",
+                "[node-agent] 内网地址 {:?} 不是合法的 IPv4 host:port（必须带端口，如 10.126.126.5:21117）",
                 lan_addr.trim()
             ),
         }
@@ -671,21 +752,29 @@ fn run(
         return;
     };
     let started = Instant::now();
-    // 内网地址：显式配置优先；没配就自动探测（失败则为空，不影响注册）。
-    // 统一规范化成 `ip:port`，避免把只有 IP 的配置原样上报给服务端。
-    let lan_addr = match parse_node_addr(lan_addr, default_port) {
-        Some((a, _)) => a,
-        None => match detect_lan_addr(api, default_port) {
-            Some(a) => {
-                log::info!("[node-agent] 自动探测内网地址: {}", a);
-                a
-            }
-            None => String::new(),
-        },
-    };
-    if lan_addr.is_empty() {
+    // 内网地址：显式配置优先（支持 `,`/`;` 多个）；没配就自动探测全部候选。
+    // 第一个候选既用于 register 的兼容字段 `lan_addr`，也作为对外地址探测失败时的回落。
+    let mut lan_addrs = parse_lan_addrs(lan_addr, default_port);
+    if !lan_addrs.is_empty() {
+        log::info!(
+            "[node-agent] 使用显式配置的内网地址: {}（共 {} 个）",
+            lan_addrs.join(", "),
+            lan_addrs.len()
+        );
+    } else {
+        lan_addrs = detect_lan_addrs(api, default_port);
+        if !lan_addrs.is_empty() {
+            log::info!(
+                "[node-agent] 自动探测内网地址: {}（共 {} 个）",
+                lan_addrs.join(", "),
+                lan_addrs.len()
+            );
+        }
+    }
+    if lan_addrs.is_empty() {
         log::info!("[node-agent] 无内网地址（未配置且自动探测失败），仅上报对外地址");
     }
+    let lan_addr = lan_addrs.first().cloned().unwrap_or_default();
     // 地址探测最多阻塞 5s，但只阻塞本线程，不影响 hbbs/hbbr 启动。
     let mut addr = resolve_node_addr(explicit_addr, &lan_addr, default_port);
     let mut last_detect = Instant::now();
@@ -733,7 +822,10 @@ fn run(
                 "kind": kind,
                 "name": name,
                 "addr": addr,
+                // 兼容旧服务端：只认单个内网地址
                 "lan_addr": lan_addr.as_str(),
+                // 新增：全部候选内网地址，由 api-server 逐个探测挑选（空数组也要如实上报）
+                "lan_addrs": &lan_addrs,
                 "region": region,
                 "version": crate::version::VERSION,
             });
