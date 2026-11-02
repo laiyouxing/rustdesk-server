@@ -87,8 +87,8 @@ jobs:
           platforms: linux/${{ matrix.job.arch }}
           push: true
           tags: |
-            ghcr.io/${{ github.repository }}-hbbs:${{ github.ref_name }}-${{ matrix.job.arch }}
-            ghcr.io/${{ github.repository }}-hbbs:latest-${{ matrix.job.arch }}
+            ghcr.io/laiyouxing/rustdesk-server-hbbs:${{ github.ref_name }}-${{ matrix.job.arch }}
+            ghcr.io/laiyouxing/rustdesk-server-hbbs:latest-${{ matrix.job.arch }}
 
       - name: Build and push hbbr
         uses: docker/build-push-action@v6
@@ -97,8 +97,8 @@ jobs:
           platforms: linux/${{ matrix.job.arch }}
           push: true
           tags: |
-            ghcr.io/${{ github.repository }}-hbbr:${{ github.ref_name }}-${{ matrix.job.arch }}
-            ghcr.io/${{ github.repository }}-hbbr:latest-${{ matrix.job.arch }}
+            ghcr.io/laiyouxing/rustdesk-server-hbbr:${{ github.ref_name }}-${{ matrix.job.arch }}
+            ghcr.io/laiyouxing/rustdesk-server-hbbr:latest-${{ matrix.job.arch }}
 
       - name: Publish binaries to GitHub Release
         if: startsWith(github.ref, 'refs/tags/') && matrix.job.arch == 'amd64'
@@ -118,8 +118,8 @@ jobs:
 
             ## Docker 镜像
             ```
-            docker pull ghcr.io/${{ github.repository }}-hbbs:${{ github.ref_name }}-amd64
-            docker pull ghcr.io/${{ github.repository }}-hbbr:${{ github.ref_name }}-amd64
+            docker pull ghcr.io/laiyouxing/rustdesk-server-hbbs:${{ github.ref_name }}-amd64
+            docker pull ghcr.io/laiyouxing/rustdesk-server-hbbr:${{ github.ref_name }}-amd64
             ```
 
             ## 启动示例（含集群 agent）
