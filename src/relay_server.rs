@@ -55,6 +55,19 @@ static SINGLE_BANDWIDTH: AtomicUsize = AtomicUsize::new(128 * 1024 * 1024);
 /// 这里固定为 4Mb/s，保证"超量降速"始终有实际惩罚。
 const DOWNGRADE_LIMIT_SPEED: usize = 4 * 1024 * 1024; // 4 Mb/s
 
+/// 中继单向写入的超时时间（毫秒）。
+///
+/// `relay()` 里的转发是写在 `select!` 分支体里的 `.await`：一旦接收方不读
+/// （窗口塞满、进程卡死、socket 半开），这里就会永久阻塞，**且不会再回到
+/// select 去轮询 30 秒空闲定时器** —— 于是这条中继既不发数据、也永远不超时，
+/// 两端 socket 都关不掉，表现为对端一直卡在"已连接但不出画面"。
+/// 2026-11-04 故障 id=234485258 就是这种半死会话：控制端窗口 `win 515`
+/// 几乎不 ACK，对端仍在以 ~200KB/s 灌视频，hbbr 日志里这条中继永远不 close。
+///
+/// 取 15 秒：正常 RDP/桌面视频的单帧远小于这个量级，只有在真正"写不进去"
+/// 时才会命中，不会误杀慢链路（慢链路的写仍会在数十毫秒内完成）。
+const RELAY_WRITE_TIMEOUT_MS: u64 = 15_000;
+
 /// 全局总带宽限速器。
 ///
 /// 以前 Limiter 只在 io_loop 里 `new` 一次、apply_limits 只改原子量，
@@ -600,6 +613,25 @@ async fn make_pair_(stream: impl StreamTrait, addr: SocketAddr, key: &str, limit
     }
 }
 
+/// 带超时的单向转发。
+///
+/// 接收方不读时 `send_raw` 会永久挂起（见 [`RELAY_WRITE_TIMEOUT_MS`]），
+/// 这里用超时把它变成一次普通错误，让 [`relay`] 尽快结束、两端 socket 一起关闭。
+async fn send_with_timeout(
+    stream: &mut (dyn StreamTrait + '_),
+    bytes: Bytes,
+    to: &str,
+) -> ResultType<()> {
+    match timeout(RELAY_WRITE_TIMEOUT_MS, stream.send_raw(bytes)).await {
+        Ok(res) => res,
+        Err(_) => bail!(
+            "send to {} timeout ({}s), peer is not reading",
+            to,
+            RELAY_WRITE_TIMEOUT_MS / 1000
+        ),
+    }
+}
+
 async fn relay(
     addr: SocketAddr,
     stream: &mut impl StreamTrait,
@@ -651,7 +683,7 @@ async fn relay(
                     total += nb;
                     total_s += nb;
                     if !bytes.is_empty() {
-                        stream.send_raw(bytes.into()).await?;
+                        send_with_timeout(&mut *stream, bytes.into(), "client").await?;
                     }
                 } else {
                     break;
@@ -675,7 +707,7 @@ async fn relay(
                     total += nb;
                     total_s += nb;
                     if !bytes.is_empty() {
-                        peer.send_raw(bytes.into()).await?;
+                        send_with_timeout(&mut **peer, bytes.into(), "peer").await?;
                     }
                 } else {
                     break;
