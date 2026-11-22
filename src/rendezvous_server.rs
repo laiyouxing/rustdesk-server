@@ -55,6 +55,8 @@ enum Data {
     RelayServers0(String),
     RelayLoads(HashMap<String, i32>),
     RelayServers(RelayServers),
+    /// 从当前中继列表里剔除指定地址（管理员手动下线）。
+    RelayRemove(Vec<String>),
 }
 
 const REG_TIMEOUT: i64 = 30_000;
@@ -71,14 +73,32 @@ pub fn set_relay_update_tx(tx: mpsc::UnboundedSender<Data>) {
 
 /// 供集群 agent 调用：把调度后的中继列表热更新到正在运行的 hbbs，无需重启。
 ///
-/// 走与启动时相同的 parse_relay_servers 路径，因此 elay_servers0
-/// （健康检查基准）与 elay_servers（实际下发）会一起更新。
+/// 走与启动时相同的 parse_relay_servers 路径，因此 relay_servers0
+/// （健康检查基准）与 relay_servers（实际下发）会一起更新。
+///
+/// 列表**顺序即调度优先级**：api-server 已按分数排好序，选中继时按顺序优先，
+/// 不再做轮转（轮转会让"人工权重/调度权重"在选路上完全看不出效果）。
 pub fn apply_relay_list(list: Vec<String>) -> bool {
     if list.is_empty() {
         return false;
     }
     match RELAY_UPDATE_TX.get() {
         Some(tx) => tx.send(Data::RelayServers0(list.join(","))).is_ok(),
+        None => false,
+    }
+}
+
+/// 供集群 agent 调用：从当前中继列表里剔除指定地址（管理员手动下线的中继）。
+///
+/// 为什么需要它：调度结果为空时 agent 按设计保留旧列表，于是"下线"永远不生效
+/// （空列表分支不会去覆盖）。这里给一条**只减不增**的路径：把下线地址从保留的
+/// 列表里删掉，删到空则保留原列表（避免把中继全清空导致客户端无中继可用）。
+pub fn remove_relay_list(remove: Vec<String>) -> bool {
+    if remove.is_empty() {
+        return false;
+    }
+    match RELAY_UPDATE_TX.get() {
+        Some(tx) => tx.send(Data::RelayRemove(remove)).is_ok(),
         None => false,
     }
 }
@@ -124,6 +144,10 @@ impl Sink {
 }
 type Sender = mpsc::UnboundedSender<Data>;
 type Receiver = mpsc::UnboundedReceiver<Data>;
+/// 中继选路游标：仅在"候选负载相同"时用于分摊，不再用于整体轮转。
+///
+/// 早先每收到一次 PunchHole 就 `fetch_add(1) % candidates.len()`，等于无视
+/// api-server 的调度顺序轮流发——人工权重、调度权重在选路上完全看不出来。
 static ROTATION_RELAY_SERVER: AtomicUsize = AtomicUsize::new(0);
 type RelayServers = Vec<String>;
 /// (address, max_capacity) for load-aware relay selection.
@@ -371,6 +395,7 @@ impl RendezvousServer {
                         Data::Msg(msg, addr) => { allow_err!(socket.send(msg.as_ref(), addr).await); }
                         Data::RelayServers0(rs) => { self.parse_relay_servers(&rs); }
                         Data::RelayServers(rs) => { self.relay_servers = Arc::new(rs); }
+                        Data::RelayRemove(addrs) => { self.remove_relay_servers(&addrs); }
                         Data::RelayLoads(loads) => { *self.relay_loads.lock().await = loads; }
                     }
                 }
@@ -1234,32 +1259,107 @@ impl RendezvousServer {
         self.relay_infos = infos;
     }
 
+    /// 从当前中继列表里剔除指定地址（管理员手动下线）。
+    ///
+    /// 与 `parse_relay_servers` 的区别：这里**只减不增**，且两处状态一起剔除
+    /// （`relay_servers0` 是健康检查基准，只改 `relay_servers` 会在下次
+    /// check_relay_servers 后把它加回来）。全部被剔除时保留原列表并告警：
+    /// 中继全清空会让客户端彻底没有中继可用，比"下线没生效"更糟。
+    fn remove_relay_servers(&mut self, addrs: &[String]) {
+        let keep = |list: &RelayServers| -> RelayServers {
+            list.iter()
+                .filter(|s| !addrs.iter().any(|a| a == *s))
+                .cloned()
+                .collect()
+        };
+        let new0 = keep(&self.relay_servers0);
+        if new0.is_empty() {
+            log::warn!(
+                "调度下线的中继 {:?} 覆盖了全部中继，保留原列表避免无中继可用",
+                addrs
+            );
+            return;
+        }
+        let new_servers = keep(&self.relay_servers);
+        // relay_infos 同步剔除，否则被下线地址的 capacity 会残留
+        self.relay_infos
+            .retain(|(addr, _)| !addrs.iter().any(|a| a == addr));
+        self.relay_servers0 = Arc::new(new0.clone());
+        // relay_servers 可能被 check_relay_servers 换成只剩存活项的列表，
+        // 剔除后为空说明原本就全部不存活，回落到新的基准列表。
+        self.relay_servers = Arc::new(if new_servers.is_empty() {
+            new0
+        } else {
+            new_servers
+        });
+        log::info!("已按调度剔除下线中继: {:?}", addrs);
+    }
+
     async fn get_relay_server(&self, _pa: IpAddr, _pb: IpAddr) -> String {
         if self.relay_servers.is_empty() {
             return "".to_owned();
         } else if self.relay_servers.len() == 1 {
             return self.relay_servers[0].clone();
         }
-        // Find relays under 80% load, fall back to any healthy relay
-        let loads = self.relay_loads.lock().await;
-        let mut candidates: Vec<&str> = Vec::new();
-        for s in self.relay_servers.iter() {
-            let default_entry = (s.clone(), 100);
-            let (host, capacity) = self.relay_infos.iter()
-                .find(|(addr, _)| s.starts_with(addr) || addr.starts_with(s))
-                .unwrap_or(&default_entry);
-            let conns = loads.get(host).copied().unwrap_or(0);
-            if *capacity <= 0 || conns as f64 / (*capacity as f64) < 0.8 {
-                candidates.push(s);
+        // 按调度顺序选路：relay_servers 的顺序就是 api-server 排好的优先级
+        // （分数升序），取第一台未过载的即可。
+        //
+        // 早先这里用 ROTATION_RELAY_SERVER 做全局轮转，等于把调度顺序丢掉，
+        // 于是"调人工权重 / 调度权重"在客户端实际连的中继上看不出任何变化。
+        // 现在轮转只在"负载率并列"之间分摊，见下面的分支。
+        //
+        // 先把 (地址, 容量, 连接数) 快照出来再放锁：下面的循环要提前 return，
+        // 持有 guard 的闭包会让 borrow checker 拒绝 drop。
+        let snapshot: Vec<(String, i32, i32)> = {
+            let loads = self.relay_loads.lock().await;
+            self.relay_servers
+                .iter()
+                .map(|s| {
+                    let default_entry = (s.clone(), 100);
+                    let (host, capacity) = self
+                        .relay_infos
+                        .iter()
+                        .find(|(addr, _)| s.starts_with(addr.as_str()) || addr.starts_with(s))
+                        .unwrap_or(&default_entry);
+                    let conns = loads.get(host).copied().unwrap_or(0);
+                    (s.clone(), *capacity, conns)
+                })
+                .collect()
+        };
+
+        // 1) 按调度顺序，第一台未过载（<80%）的中继直接胜出
+        for (addr, capacity, conns) in snapshot.iter() {
+            if *capacity <= 0 || *conns as f64 / (*capacity as f64) < 0.8 {
+                return addr.clone();
             }
         }
-        drop(loads);
-        if candidates.is_empty() {
-            // All overloaded, pick the least loaded one
-            candidates = self.relay_servers.iter().map(|s| s.as_str()).collect();
+
+        // 2) 全部过载：取负载率最低的一台；负载率并列时按调度顺序取靠前的，
+        //    并用轮转在**并列**项之间分摊，避免永远打到同一台。
+        let mut best: Vec<&str> = Vec::new();
+        let mut best_ratio = f64::MAX;
+        for (addr, capacity, conns) in snapshot.iter() {
+            let ratio = if *capacity <= 0 {
+                0.0
+            } else {
+                *conns as f64 / *capacity as f64
+            };
+            if ratio + f64::EPSILON < best_ratio {
+                best_ratio = ratio;
+                best.clear();
+                best.push(addr);
+            } else if (ratio - best_ratio).abs() <= f64::EPSILON {
+                best.push(addr);
+            }
         }
-        let i = ROTATION_RELAY_SERVER.fetch_add(1, Ordering::SeqCst) % candidates.len();
-        candidates[i].to_string()
+        if best.is_empty() {
+            return self.relay_servers[0].clone();
+        }
+        if best.len() == 1 {
+            return best[0].to_owned();
+        }
+        let i = ROTATION_RELAY_SERVER.fetch_add(1, Ordering::SeqCst) % best.len();
+        best[i].to_owned()
     }
 
     async fn check_cmd(&self, cmd: &str) -> String {
@@ -1639,21 +1739,26 @@ impl RendezvousServer {
 
 async fn check_relay_servers(rs0: Arc<RelayServers>, tx: Sender) {
     let mut futs = Vec::new();
-    let rs = Arc::new(Mutex::new(Vec::new()));
+    // 存活结果按 rs0 的**下标**回填，而不是"探测完就 push"。
+    // 早先的写法顺序 = 探测完成先后，等于把 api-server 排好的调度顺序彻底打乱，
+    // 于是人工权重/调度权重在最终选路上看不出任何效果。
+    let alive: Arc<Mutex<Vec<Option<String>>>> = Arc::new(Mutex::new(vec![None; rs0.len()]));
     let loads = Arc::new(Mutex::new(HashMap::new()));
-    for x in rs0.iter() {
+    for (i, x) in rs0.iter().enumerate() {
         let mut host = x.to_owned();
         if !host.contains(':') {
             host = format!("{}:{}", host, config::RELAY_PORT);
         }
-        let rs = rs.clone();
+        let alive = alive.clone();
         let loads = loads.clone();
         let x = x.clone();
         futs.push(tokio::spawn(async move {
             // Check relay liveness via FramedStream (existing behavior)
-            let alive = FramedStream::new(&host, None, CHECK_RELAY_TIMEOUT).await.is_ok();
-            if alive {
-                rs.lock().await.push(x);
+            let is_alive = FramedStream::new(&host, None, CHECK_RELAY_TIMEOUT).await.is_ok();
+            if is_alive {
+                if let Some(slot) = alive.lock().await.get_mut(i) {
+                    *slot = Some(x);
+                }
                 // Query load via raw TCP (send 0x00, read JSON response)
                 // Use raw TcpStream because FramedStream adds length-delimited framing
                 use hbb_common::tokio::io::AsyncWriteExt;
@@ -1681,7 +1786,11 @@ async fn check_relay_servers(rs0: Arc<RelayServers>, tx: Sender) {
     }
     join_all(futs).await;
     log::debug!("check_relay_servers");
-    let rs = std::mem::take(&mut *rs.lock().await);
+    // 按调度顺序收集存活项（下标顺序 = rs0 顺序）
+    let rs: RelayServers = {
+        let slots = alive.lock().await;
+        slots.iter().flatten().cloned().collect()
+    };
     if !rs.is_empty() {
         tx.send(Data::RelayServers(rs)).ok();
     }

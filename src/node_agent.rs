@@ -50,6 +50,8 @@ use std::time::{Duration, Instant};
 
 /// 中继列表热更新回调（仅 hbbs 注册）
 type RelayApply = fn(Vec<String>) -> bool;
+/// 从当前中继列表剔除指定地址的回调（仅 hbbs 注册）
+type RelayRemove = fn(Vec<String>) -> bool;
 /// 限速热更新回调（仅 hbbr 注册）。
 ///
 /// 参数为 `Option<usize>`：`None` = 保持不变，`Some(0)` = 不限制（解除限速）。
@@ -63,6 +65,7 @@ type CountGetter = fn() -> usize;
 type BwGetter = fn() -> (u64, u64);
 
 static RELAY_APPLY: once_cell::sync::OnceCell<RelayApply> = once_cell::sync::OnceCell::new();
+static RELAY_REMOVE: once_cell::sync::OnceCell<RelayRemove> = once_cell::sync::OnceCell::new();
 static LIMITS_APPLY: once_cell::sync::OnceCell<LimitsApply> = once_cell::sync::OnceCell::new();
 /// hbbr 活跃连接数 getter（由 relay_server 注册）
 static CONNS_GETTER: once_cell::sync::OnceCell<CountGetter> = once_cell::sync::OnceCell::new();
@@ -108,6 +111,16 @@ const LAN_ADDR_MAX: usize = 4;
 #[allow(dead_code)]
 pub fn set_relay_apply(f: RelayApply) {
     let _ = RELAY_APPLY.set(f);
+}
+
+/// 注册"剔除下线中继"回调（hbbs 启动时调用）。
+///
+/// 与 `set_relay_apply` 分开是必要的：下发列表是**整体替换**，而剔除是
+/// **只减不增**。调度结果为空时前者按设计保留旧列表，于是"管理员下线"
+/// 永远不生效；后者专门用来把下线地址从保留的列表里删掉。
+#[allow(dead_code)]
+pub fn set_relay_remove(f: RelayRemove) {
+    let _ = RELAY_REMOVE.set(f);
 }
 
 /// 注册限速热更新回调（hbbr 启动时调用）。
@@ -1041,6 +1054,28 @@ fn pull_and_apply_relays(client: &reqwest::blocking::Client, api: &str, key: &st
         log::warn!("[node-agent] 中继列表格式异常");
         return;
     };
+    // 管理员手动下线的中继地址。它们可能仍出现在我们**保留的旧列表**里
+    // （调度返回空时按设计不覆盖），因此单独剔除一次。
+    let disabled: Vec<String> = v["data"]["disabled"]
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|x| x.as_str())
+                .map(|s| s.trim().to_owned())
+                .filter(|s| !s.is_empty())
+                .collect()
+        })
+        .unwrap_or_default();
+    if !disabled.is_empty() {
+        match RELAY_REMOVE.get() {
+            Some(f) => {
+                if f(disabled.clone()) {
+                    log::info!("[node-agent] 已剔除下线中继: {:?}", disabled);
+                }
+            }
+            None => log::debug!("[node-agent] 本进程未注册剔除回调，跳过了下线中继"),
+        }
+    }
     // 中继列表**只放对外（公网）地址**。
     //
     // 内网地址不能摊平进来：客户端选中的中继地址会通过 RequestRelay 原样转发给对端

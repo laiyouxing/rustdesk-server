@@ -28,6 +28,9 @@ fn main() -> ResultType<()> {
     init_args(&args, "hbbs", "RustDesk ID/Rendezvous Server");
     // 集群 agent：注册到 api-server 并定期上报；同时注册中继列表热更新回调
     node_agent::set_relay_apply(rendezvous_server::apply_relay_list);
+    // 剔除下线中继：调度结果为空时会保留旧列表，只靠上面的"整体替换"无法让
+    // 管理员手动下线的中继真正下线。
+    node_agent::set_relay_remove(rendezvous_server::remove_relay_list);
     // 在线 peer 数由 RendezvousServer 维护（io_loop 每 3s 刷新），agent 心跳实时取值。
     // 原实现的 ONLINE_PEERS 原子量从未被写入，peers 恒为 0。
     node_agent::set_peers_getter(rendezvous_server::online_peers);
